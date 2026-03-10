@@ -16,6 +16,7 @@ private:
 	restoring_toggle_state<1> collision_flag;
 	restoring_toggle_state<2> disable_cam;
 	tweakable_value_set<float, 5> camera_values;
+	tweakable_value_set<float, 3> fov_value;
 
 	restoring_toggle_state<1> infinite_flag;
 	tweakable_value_set<float, 1> infinite_bow_shooting;
@@ -23,11 +24,15 @@ private:
 
 	float current_pitch = 0.0f;
 	float current_yaw = 0.0f;
+	float joystick_sensitivity = 76.2722;
 	static constexpr int camera_forward = 0;
 	static constexpr int camera_up = 1;
 	static constexpr int camera_right = 2;
 	static constexpr int camera_yaw = 3;
 	static constexpr int camera_pitch = 4;
+	static constexpr int camera_fov_menu = 0;
+	static constexpr int camera_fov_regular = 1;
+	static constexpr int camera_fov_neg = 2;
 
 	static constexpr int bow_shoot_speed = 0;
 	static constexpr int bow_ammo = 0;
@@ -42,14 +47,17 @@ public:
 			{ 0x001343F0, 0x03E00008, 0x27BDFFE0  },// Camera disable	
 			{ 0x0015DF90, 0x03E00008, 0x0080382D  },// Disable culling based on Rynns view
 		} })
+		, fov_value(ps2, { 
+			 { 0x006C65E0, 0x06C668C, 0x006C6674 },
+		})
 		, camera_values(ps2, {
 			0x006C6810, // camera forward
 			0x006C680C, // camera up/down
 			0x006C6808, // camera right
 			0x00000000, // camera yaw
 			0x00000000, // camera pitch
-			})
-			, infinite_flag(ps2, { {0x00000000, 0x00000001 , 0x00000000} })
+		})
+		, infinite_flag(ps2, {})
 		, infinite_bow_shooting(ps2, { {
 			0x00C4E604  // infinite arrows
 		} })
@@ -62,6 +70,14 @@ public:
 	void draw_game_ui(const pcsx2& ps2, const controller& c, playback& camera_playback) override
 	{
 		ImGui::Text("game running.");
+
+		if (ImGui::Button("ModifyFOV")) 
+		{
+			fov_value.toggle_tweaking();
+			sentinel.increment();
+		} ImGui::SameLine();		
+
+		ImGui::SliderFloat("Fov", &joystick_sensitivity, 20.0f, 180.0f, "%.2f");
 
 		if (!collision_flag.is_on())
 		{
@@ -145,20 +161,19 @@ public:
 			glm::vec3 pos_delta = shared_camera::compute_freecam_pos_delta(c, glm::vec2(move_scale, -move_scale), current_yaw, current_pitch);
 			glm::vec3 pos = glm::vec3(camera_values.get(camera_right), camera_values.get(camera_forward), camera_values.get(camera_up)) + pos_delta;
 
-			camera_playback.update(time_delta, current_yaw, current_pitch, pos.x, pos.y, pos.z);
-
-			if (camera_playback.update(time_delta, current_yaw, current_pitch, pos.x, pos.y, pos.z))
-			{
-				camera_values.set(camera_yaw, current_yaw);
-				camera_values.set(camera_pitch, current_pitch);
-			}
-
 			camera_values.set(camera_forward, pos.y);
 			camera_values.set(camera_up, pos.z);
 
 			camera_values.set(camera_right, pos.x);
 
 			camera_values.flush(ps2);
+		}
+
+		if (fov_value.currently_tweaking()) {
+			fov_value.set(camera_fov_menu, joystick_sensitivity);
+			fov_value.set(camera_fov_regular, joystick_sensitivity);
+			fov_value.set(camera_fov_neg, -joystick_sensitivity);
+			fov_value.flush(ps2);
 		}
 	}
 };
