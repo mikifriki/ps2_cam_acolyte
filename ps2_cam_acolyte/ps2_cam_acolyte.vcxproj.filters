@@ -103,6 +103,9 @@
     <ClCompile Include="games\61A7E622_silent_hill_shattered_memories.cpp">
       <Filter>Source Files\games</Filter>
     </ClCompile>
+    <ClCompile Include="games\65F91A26_drakan_the_ancient_gates.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="controller.h">

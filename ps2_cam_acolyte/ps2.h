@@ -6,6 +6,7 @@
 #include "playback.h"
 #include "ps2_game.h"
 #include "ps2_commands.h"
+#include <chrono>
 
 class controller;
 
