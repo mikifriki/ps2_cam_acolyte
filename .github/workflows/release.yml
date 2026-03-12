@@ -1,0 +1,32 @@
+name: Build on Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build-windows:
+    name: Build PS2 Cam Acolyte (Windows)
+    runs-on: windows-latest
+
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Build solution
+      run: msbuild ps2_cam_acolyte/ps2_cam_acolyte.sln -p:Configuration=Release
+
+    - name: Collect runtime assets
+      run: |
+        mkdir out
+        copy ps2_cam_acolyte\Release\ps2_cam_acolyte.exe out\
+        copy third_party\SDL2\lib\x64\SDL2.dll out\
+        copy third_party\SDL_gamecontrollerdb\gamecontrollerdb.txt out\
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: ps2_cam_acolyte-windows
+        path: out/
