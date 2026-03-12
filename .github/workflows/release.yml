@@ -30,3 +30,14 @@ jobs:
       with:
         name: ps2_cam_acolyte-windows
         path: out/
+
+    - name: Zip output
+      run: powershell -c "Compress-Archive -Path out/* -DestinationPath ps2_cam_acolyte-windows.zip"
+
+    - name: Upload Release Asset
+      uses: softprops/action-upload-release-asset@v1
+      with:
+        upload_url: ${{ github.event.release.upload_url }}
+        asset_path: ps2_cam_acolyte-windows.zip
+        asset_name: ps2_cam_acolyte-windows.zip
+        asset_content_type: application/zip
