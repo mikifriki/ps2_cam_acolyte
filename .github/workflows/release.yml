@@ -17,14 +17,14 @@ jobs:
       uses: microsoft/setup-msbuild@v2
 
     - name: Build solution
-      run: msbuild ps2_cam_acolyte/ps2_cam_acolyte.sln -p:Configuration=Release
+      run: msbuild ps2_cam_acolyte/ps2_cam_acolyte.sln -p:Configuration=Release -p:Platform=x64
 
     - name: Collect runtime assets
       run: |
         mkdir out
-        copy ps2_cam_acolyte\Release\ps2_cam_acolyte.exe out\
-        copy third_party\SDL2\lib\x64\SDL2.dll out\
-        copy third_party\SDL_gamecontrollerdb\gamecontrollerdb.txt out\
+        copy ps2_cam_acolyte\x64\Release\ps2_cam_acolyte.exe out\
+        copy ps2_cam_acolyte\x64\Release\SDL2.dll out\
+        copy ps2_cam_acolyte\x64\Release\gamecontrollerdb.txt out\
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
