@@ -16,9 +16,10 @@ private:
 	restoring_toggle_state<1> collision_flag;
 	restoring_toggle_state<2> disable_cam;
 	tweakable_value_set<float, 5> camera_values;
-	tweakable_value_set<float, 3> fov_value;
+	tweakable_value_set<float, 3> fov_values;
 
 	restoring_toggle_state<1> infinite_flag;
+	restoring_toggle_state<1> true_god_mode;
 	tweakable_value_set<float, 1> infinite_bow_shooting;
 	tweakable_value_set<double, 1> infinite_bow_ammo;
 
@@ -47,7 +48,7 @@ public:
 			{ 0x001343F0, 0x03E00008, 0x27BDFFE0  },// Camera disable	
 			{ 0x0015DF90, 0x03E00008, 0x0080382D  },// Disable culling based on Rynns view
 		} })
-		, fov_value(ps2, { 
+		, fov_values(ps2, { 
 			 { 0x006C65E0, 0x06C668C, 0x006C6674 },
 		})
 		, camera_values(ps2, {
@@ -59,10 +60,13 @@ public:
 		})
 		, infinite_flag(ps2, {})
 		, infinite_bow_shooting(ps2, { {
-			0x00C4E604  // infinite arrows
+			0x00C4E604  // infinite shoot speed
 		} })
 		, infinite_bow_ammo(ps2, { {
 			0x00d245a0  // infinite arrows
+		} })
+		, true_god_mode(ps2, { {
+			{ 0x003D5530, 0x03E00008, 0x00A0302D }	// True god mode. Ignores fall damage.
 		} })
 	{
 	}
@@ -73,7 +77,7 @@ public:
 
 		if (ImGui::Button("ModifyFOV")) 
 		{
-			fov_value.toggle_tweaking();
+			fov_values.toggle_tweaking();
 			sentinel.increment();
 		} ImGui::SameLine();		
 
@@ -115,6 +119,22 @@ public:
 			}
 		}
 
+		if (!true_god_mode.is_on()) {
+			if (ImGui::Button("Enable True God mode"))
+			{
+				true_god_mode.set_on(true);
+				sentinel.increment();
+			}
+		}
+		else if (true_god_mode.is_on())
+		{
+			if (ImGui::Button("Disable True God mode"))
+			{
+				true_god_mode.set_on(false);
+				sentinel.increment();
+			}
+		}
+
 		if (!infinite_flag.is_on()) {
 			if (ImGui::Button("Enable infinite bow ammo/shoot speed"))
 			{
@@ -142,6 +162,13 @@ public:
 		{
 			collision_flag.reset();
 			disable_cam.reset();
+			camera_values.reset();
+			fov_values.reset();
+			infinite_flag.reset();
+			true_god_mode.reset();
+			infinite_bow_shooting.reset();
+			infinite_bow_ammo.reset();
+
 		}
 
 		if (infinite_bow_shooting.currently_tweaking()) {
@@ -169,11 +196,11 @@ public:
 			camera_values.flush(ps2);
 		}
 
-		if (fov_value.currently_tweaking()) {
-			fov_value.set(camera_fov_menu, joystick_sensitivity);
-			fov_value.set(camera_fov_regular, joystick_sensitivity);
-			fov_value.set(camera_fov_neg, -joystick_sensitivity);
-			fov_value.flush(ps2);
+		if (fov_values.currently_tweaking()) {
+			fov_values.set(camera_fov_menu, joystick_sensitivity);
+			fov_values.set(camera_fov_regular, joystick_sensitivity);
+			fov_values.set(camera_fov_neg, -joystick_sensitivity);
+			fov_values.flush(ps2);
 		}
 	}
 };
