@@ -37,6 +37,7 @@ private:
 
 	static constexpr int bow_shoot_speed = 0;
 	static constexpr int bow_ammo = 0;
+	bool show_experimental_options = false;
 
 public:
 	explicit drakan(const pcsx2& ps2)
@@ -75,13 +76,13 @@ public:
 	{
 		ImGui::Text("game running.");
 
-		if (ImGui::Button("ModifyFOV")) 
+		if (ImGui::Button("Modify FOV")) 
 		{
 			fov_values.toggle_tweaking();
 			sentinel.increment();
 		} ImGui::SameLine();		
 
-		ImGui::SliderFloat("Fov", &joystick_sensitivity, 20.0f, 180.0f, "%.2f");
+		ImGui::SliderFloat("", &joystick_sensitivity, 20.0f, 180.0f, "%.2f");
 
 		if (!collision_flag.is_on())
 		{
@@ -96,25 +97,6 @@ public:
 			if (ImGui::Button("Enable Collision"))
 			{
 				collision_flag.set_on(false);
-				sentinel.increment();
-			}
-		}
-
-		if (!disable_cam.is_on())
-		{
-			if (ImGui::Button("Enable Free Cam"))
-			{
-				disable_cam.set_on(true);
-				camera_values.toggle_tweaking();
-				sentinel.increment();
-			}
-		}
-		else if (disable_cam.is_on())
-		{
-			if (ImGui::Button("Disable Free Cam"))
-			{
-				camera_values.toggle_tweaking();
-				disable_cam.set_on(false);
 				sentinel.increment();
 			}
 		}
@@ -135,23 +117,46 @@ public:
 			}
 		}
 
-		if (!infinite_flag.is_on()) {
-			if (ImGui::Button("Enable infinite bow ammo/shoot speed"))
-			{
-				infinite_flag.set_on(true);
-				infinite_bow_shooting.toggle_tweaking();
-				infinite_bow_ammo.toggle_tweaking();
-				sentinel.increment();
-			}
-		}
-		else if (infinite_flag.is_on())
+		ImGui::Checkbox("Enable Experiments", &show_experimental_options);
+		if (show_experimental_options)
 		{
-			if (ImGui::Button("Disable infinite bow ammo/shoot speed"))
+			if (!disable_cam.is_on())
 			{
-				infinite_flag.set_on(false);
-				infinite_bow_shooting.toggle_tweaking();
-				infinite_bow_ammo.toggle_tweaking();
-				sentinel.increment();
+				if (ImGui::Button("Enable Experimental Free Cam"))
+				{
+					disable_cam.set_on(true);
+					camera_values.toggle_tweaking();
+					sentinel.increment();
+				}
+			}
+			else if (disable_cam.is_on())
+			{
+				if (ImGui::Button("Disable Experimental Free Cam"))
+				{
+					camera_values.toggle_tweaking();
+					disable_cam.set_on(false);
+					sentinel.increment();
+				}
+			}
+
+			if (!infinite_flag.is_on()) {
+				if (ImGui::Button("Enable infinite bow ammo/shoot speed"))
+				{
+					infinite_flag.set_on(true);
+					infinite_bow_shooting.toggle_tweaking();
+					infinite_bow_ammo.toggle_tweaking();
+					sentinel.increment();
+				}
+			}
+			else if (infinite_flag.is_on())
+			{
+				if (ImGui::Button("Disable infinite bow ammo/shoot speed"))
+				{
+					infinite_flag.set_on(false);
+					infinite_bow_shooting.toggle_tweaking();
+					infinite_bow_ammo.toggle_tweaking();
+					sentinel.increment();
+				}
 			}
 		}
 	}
@@ -182,8 +187,8 @@ public:
 			float turn_scale = time_delta * 5.0f;
 			float move_scale = time_delta * 5000.0f;
 
-			 float current_yaw = camera_values.get(camera_yaw);
-			 float current_pitch = camera_values.get(camera_pitch);
+			float current_yaw = camera_values.get(camera_yaw);
+			float current_pitch = camera_values.get(camera_pitch);
 
 			glm::vec3 pos_delta = shared_camera::compute_freecam_pos_delta(c, glm::vec2(move_scale, -move_scale), current_yaw, current_pitch);
 			glm::vec3 pos = glm::vec3(camera_values.get(camera_right), camera_values.get(camera_forward), camera_values.get(camera_up)) + pos_delta;
