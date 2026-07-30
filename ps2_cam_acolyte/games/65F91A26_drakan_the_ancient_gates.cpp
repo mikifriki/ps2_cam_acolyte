@@ -164,39 +164,33 @@ public:
 		ImGui::Text("Y: %.3f", player_position.get(position_y));
 		ImGui::Text("Z: %.3f", player_position.get(position_z));
 
+
+		if (fly_state == fly_command_state::waiting_for_completion)
+		{
+			ImGui::Text("Fly command waiting for active gameplay...");
+		}
+		else if (!fly_enabled)
+		{
+			if (ImGui::Button("Enable Debug Fly"))
+			{
+				start_fly_command(ps2);
+			}
+		}
+		else
+		{
+			if (ImGui::Button("Disable Debug Fly"))
+			{
+				start_fly_command(ps2);
+			}
+		}
+
+
 		if (!position_editor_initialized)
 		{
 			position_edit[position_x] = player_position.get(position_x);
 			position_edit[position_y] = player_position.get(position_y);
 			position_edit[position_z] = player_position.get(position_z);
 			position_editor_initialized = true;
-		}
-
-		ImGui::Separator();
-		ImGui::Text("Set Rynn world position");
-		ImGui::InputFloat("Set X", &position_edit[position_x], 0.0f, 0.0f, "%.3f");
-		ImGui::InputFloat("Set Y", &position_edit[position_y], 0.0f, 0.0f, "%.3f");
-		ImGui::InputFloat("Set Z", &position_edit[position_z], 0.0f, 0.0f, "%.3f");
-
-		if (ImGui::Button("Apply Position"))
-		{
-			if (std::isfinite(position_edit[position_x]) &&
-				std::isfinite(position_edit[position_y]) &&
-				std::isfinite(position_edit[position_z]))
-			{
-				ps2_ipc_cmd cmd(ps2);
-				cmd.write<float>(0x00A6AE14, position_edit[position_x]);
-				cmd.write<float>(0x00A6AE18, position_edit[position_y]);
-				cmd.write<float>(0x00A6AE1C, position_edit[position_z]);
-				cmd.send();
-			}
-		}
-		ImGui::SameLine();
-		if (ImGui::Button("Use Current Position"))
-		{
-			position_edit[position_x] = player_position.get(position_x);
-			position_edit[position_y] = player_position.get(position_y);
-			position_edit[position_z] = player_position.get(position_z);
 		}
 
 		if (ImGui::Button("Modify FOV")) 
@@ -243,24 +237,33 @@ public:
 		ImGui::Checkbox("Enable Experiments", &show_experimental_options);
 		if (show_experimental_options)
 		{
-			if (fly_state == fly_command_state::waiting_for_completion)
+			ImGui::Separator();
+			ImGui::Text("Set Rynn world position");
+			ImGui::InputFloat("Set X", &position_edit[position_x], 0.0f, 0.0f, "%.3f");
+			ImGui::InputFloat("Set Y", &position_edit[position_y], 0.0f, 0.0f, "%.3f");
+			ImGui::InputFloat("Set Z", &position_edit[position_z], 0.0f, 0.0f, "%.3f");
+
+			if (ImGui::Button("Apply Position"))
 			{
-				ImGui::Text("Fly command waiting for active gameplay...");
-			}
-			else if (!fly_enabled)
-			{
-				if (ImGui::Button("Enable Debug Fly"))
+				if (std::isfinite(position_edit[position_x]) &&
+					std::isfinite(position_edit[position_y]) &&
+					std::isfinite(position_edit[position_z]))
 				{
-					start_fly_command(ps2);
+					ps2_ipc_cmd cmd(ps2);
+					cmd.write<float>(0x00A6AE14, position_edit[position_x]);
+					cmd.write<float>(0x00A6AE18, position_edit[position_y]);
+					cmd.write<float>(0x00A6AE1C, position_edit[position_z]);
+					cmd.send();
 				}
 			}
-			else
+			ImGui::SameLine();
+			if (ImGui::Button("Use Current Position"))
 			{
-				if (ImGui::Button("Disable Debug Fly"))
-				{
-					start_fly_command(ps2);
-				}
+				position_edit[position_x] = player_position.get(position_x);
+				position_edit[position_y] = player_position.get(position_y);
+				position_edit[position_z] = player_position.get(position_z);
 			}
+
 
 			if (!infinite_flag.is_on()) {
 				if (ImGui::Button("Enable infinite bow ammo/shoot speed"))
