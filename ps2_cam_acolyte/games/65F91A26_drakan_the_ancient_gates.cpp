@@ -19,6 +19,8 @@ private:
 	restoring_toggle_state<1> collision_flag;
 	tweakable_value_set<float, 3> fov_values;
 	read_only_value_set<float, 3> player_position;
+	uint32_t player_position_address = 0;
+	bool player_position_available = false;
 	float position_edit[3] = { 0.0f, 0.0f, 0.0f };
 	bool position_editor_initialized = false;
 
@@ -33,11 +35,46 @@ private:
 	static constexpr int camera_fov_menu = 0;
 	static constexpr int camera_fov_regular = 1;
 	static constexpr int camera_fov_neg = 2;
+	static constexpr uint32_t manager_global = 0x00555A54;
+	static constexpr uint32_t player_pointer_offset = 0x4B0;
+	static constexpr uint32_t player_position_offset = 0x14;
 
 
 	static constexpr int bow_shoot_speed = 0;
 	static constexpr int bow_ammo = 0;
 	bool show_experimental_options = false;
+
+	bool update_player_position(const pcsx2& ps2)
+	{
+		ps2_ipc_cmd manager_read(ps2);
+		auto manager = manager_read.queue_read<uint32_t>(manager_global);
+		manager_read.send();
+		const auto manager_address = manager_read.read(manager);
+
+		if (manager_address == 0)
+		{
+			player_position_address = 0;
+			player_position_available = false;
+			return false;
+		}
+
+		ps2_ipc_cmd player_read(ps2);
+		auto player = player_read.queue_read<uint32_t>(manager_address + player_pointer_offset);
+		player_read.send();
+		const auto player_address = player_read.read(player);
+
+		if (player_address == 0)
+		{
+			player_position_address = 0;
+			player_position_available = false;
+			return false;
+		}
+
+		player_position_address = player_address + player_position_offset;
+		player_position.update_base_address(player_position_address);
+		player_position_available = true;
+		return true;
+	}
 
 	// Retail USA retained debug-command wrapper. It submits the raw "fly" command
 	// once and restores the update hook after the game has returned from it.
@@ -164,6 +201,34 @@ public:
 		ImGui::Text("Y: %.3f", player_position.get(position_y));
 		ImGui::Text("Z: %.3f", player_position.get(position_z));
 
+		ImGui::Text("Set Rynn world position");
+		ImGui::InputFloat("Set X", &position_edit[position_x], 0.0f, 0.0f, "%.3f");
+		ImGui::InputFloat("Set Y", &position_edit[position_y], 0.0f, 0.0f, "%.3f");
+		ImGui::InputFloat("Set Z", &position_edit[position_z], 0.0f, 0.0f, "%.3f");
+
+		if (ImGui::Button("Apply Position"))
+		{
+			if (player_position_available &&
+				std::isfinite(position_edit[position_x]) &&
+				std::isfinite(position_edit[position_y]) &&
+				std::isfinite(position_edit[position_z]))
+			{
+				ps2_ipc_cmd cmd(ps2);
+				cmd.write<float>(player_position_address + (position_x * sizeof(float)), position_edit[position_x]);
+				cmd.write<float>(player_position_address + (position_y * sizeof(float)), position_edit[position_y]);
+				cmd.write<float>(player_position_address + (position_z * sizeof(float)), position_edit[position_z]);
+				cmd.send();
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Use Current Position"))
+		{
+			position_edit[position_x] = player_position.get(position_x);
+			position_edit[position_y] = player_position.get(position_y);
+			position_edit[position_z] = player_position.get(position_z);
+		}
+
+		ImGui::Separator();
 
 		if (fly_state == fly_command_state::waiting_for_completion)
 		{
@@ -185,7 +250,7 @@ public:
 		}
 
 
-		if (!position_editor_initialized)
+		if (!position_editor_initialized && player_position_available)
 		{
 			position_edit[position_x] = player_position.get(position_x);
 			position_edit[position_y] = player_position.get(position_y);
@@ -238,32 +303,7 @@ public:
 		if (show_experimental_options)
 		{
 			ImGui::Separator();
-			ImGui::Text("Set Rynn world position");
-			ImGui::InputFloat("Set X", &position_edit[position_x], 0.0f, 0.0f, "%.3f");
-			ImGui::InputFloat("Set Y", &position_edit[position_y], 0.0f, 0.0f, "%.3f");
-			ImGui::InputFloat("Set Z", &position_edit[position_z], 0.0f, 0.0f, "%.3f");
-
-			if (ImGui::Button("Apply Position"))
-			{
-				if (std::isfinite(position_edit[position_x]) &&
-					std::isfinite(position_edit[position_y]) &&
-					std::isfinite(position_edit[position_z]))
-				{
-					ps2_ipc_cmd cmd(ps2);
-					cmd.write<float>(0x00A6AE14, position_edit[position_x]);
-					cmd.write<float>(0x00A6AE18, position_edit[position_y]);
-					cmd.write<float>(0x00A6AE1C, position_edit[position_z]);
-					cmd.send();
-				}
-			}
-			ImGui::SameLine();
-			if (ImGui::Button("Use Current Position"))
-			{
-				position_edit[position_x] = player_position.get(position_x);
-				position_edit[position_y] = player_position.get(position_y);
-				position_edit[position_z] = player_position.get(position_z);
-			}
-
+	
 
 			if (!infinite_flag.is_on()) {
 				if (ImGui::Button("Enable infinite bow ammo/shoot speed"))
@@ -289,11 +329,13 @@ public:
 
 	void update(const pcsx2& ps2, const controller_state& c, playback& camera_playback, float time_delta) override
 	{
-		player_position.update();
+		update_player_position(ps2);
 
 		if (sentinel.has_reset())
 		{
 			position_editor_initialized = false;
+			player_position_address = 0;
+			player_position_available = false;
 			collision_flag.reset();
 			fov_values.reset();
 			infinite_flag.reset();
