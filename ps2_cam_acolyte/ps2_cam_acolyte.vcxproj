@@ -151,6 +151,7 @@ copy "$(ProjectDir)\..\third_party\sdl_gamecontrollerdb\gamecontrollerdb.txt" "$
     <ClCompile Include="..\third_party\imgui\imgui_widgets.cpp" />
     <ClCompile Include="controller.cpp" />
     <ClCompile Include="games\00000000_nothing.cpp" />
+    <ClCompile Include="games\0FF28F8B_ESPN_Winter_X Games_Snowboarding_2002.cpp" />
     <ClCompile Include="games\053D2239_metal_gear_solid_3.cpp" />
     <ClCompile Include="games\3919136D_silent_hill_4.cpp" />
     <ClCompile Include="games\61A7E622_silent_hill_shattered_memories.cpp" />
