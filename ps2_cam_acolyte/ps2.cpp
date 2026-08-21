@@ -81,7 +81,7 @@ bool pcsx2::update()
         camera_playback.clear();
     }
 
-    if (camera_playback.needs_render())
+    if (camera_playback.needs_render() || (current_game && current_game->needs_ui_refresh()))
     {
         return true;
     }

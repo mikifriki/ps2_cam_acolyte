@@ -96,6 +96,9 @@ public:
 	virtual ~ps2_game() {}
 	virtual void update(const pcsx2& ps2, const controller_state& state, playback& camera_playback, float time_delta) = 0;
 	virtual void draw_game_ui(const pcsx2& ps2, const controller& controller, playback& camera_playback) {}
+	// Opt-in UI refresh for game tools that display live read-only values.
+	// Existing games retain the previous low-overhead render behavior.
+	virtual bool needs_ui_refresh() const { return false; }
 	ps2_game() = default;
 	ps2_game(const ps2_game&) = delete;
 	ps2_game& operator=(const ps2_game&) = delete;
