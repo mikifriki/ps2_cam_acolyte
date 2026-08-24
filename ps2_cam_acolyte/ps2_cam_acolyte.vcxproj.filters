@@ -88,6 +88,9 @@
     <ClCompile Include="games\00000000_nothing.cpp">
       <Filter>Source Files\games</Filter>
     </ClCompile>
+    <ClCompile Include="games\0FF28F8B_ESPN_Winter_X Games_Snowboarding_2002.cpp">
+      <Filter>Source Files\games</Filter>
+    </ClCompile>
     <ClCompile Include="games\901AAC09_haunting_ground.cpp">
       <Filter>Source Files\games</Filter>
     </ClCompile>
