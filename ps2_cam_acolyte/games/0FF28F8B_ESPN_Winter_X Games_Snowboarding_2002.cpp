@@ -25,6 +25,8 @@ private:
 	bool zero_motion_after_position_change = true;
 	int selected_course = 0;
 	bool course_redirect_applied = false;
+	bool original_course_metadata_saved = false;
+	std::array<uint32_t, 64> original_course_metadata = {};
 
 	static constexpr int position_x = 0;
 	static constexpr int position_y = 1;
@@ -35,15 +37,33 @@ private:
 	static constexpr uint32_t physics_motion_vector_offset = 0x70;
 	static constexpr uint32_t ee_ram_size = 0x02000000;
 	static constexpr float radians_to_degrees = 57.2957795f;
-	static constexpr std::array<uint32_t, 3> course_filename_addresses = {
-		0x002B3748, 0x00334E6C, 0x018FC6B0
+	static constexpr uint32_t home_town_course_metadata = 0x018FAC80;
+	static constexpr uint32_t course_filename_pointer_index = 0x38 / sizeof(uint32_t);
+	static constexpr uint32_t course_filename_start = 0x002B3700;
+	static constexpr uint32_t course_filename_end = 0x002B3908;
+	static constexpr std::array<uint32_t, 10> course_metadata_addresses = {
+		0x018FAC80, // C03
+		0x018FAF80, // C06
+		0x018FB080, // C06B
+		0x018FB380, // C09
+		0x018FB780, // C12SES
+		0x018FBB80, // C15SES
+		0x018FBC80, // C16
+		0x018FBD80, // C17
+		0x018FC280, // C22
+		0x018FC480, // Practice
 	};
-	static constexpr std::array<const char*, 7> course_filenames = {
-		"FIELD_C03.BPX", "FIELD_C06.BPX", "FIELD_C09.BPX", "FIELD_C16.BPX",
-		"FIELD_C17.BPX", "FIELD_C22.BPX", "FIELD_C06B.BPX"
-	};
-	static constexpr std::array<const char*, 7> course_names = {
-		"Home Town (C03)", "C06", "C09", "C16", "C17", "C22", "C06B"
+	static constexpr std::array<const char*, 10> course_names = {
+		"Home Town (C03)",
+		"Storage of Water Tank (C06)",
+		"Storage of Water Tank alternate (C06B)",
+		"Abandoned Mine (C09)",
+		"C12SES alternate",
+		"C15SES alternate",
+		"The Room (C16)",
+		"Beach (C17)",
+		"Alaska Large Descent (C22)",
+		"Practice"
 	};
 
 	bool update_player_state(const pcsx2& ps2)
@@ -152,22 +172,45 @@ private:
 		write_position(ps2, target);
 	}
 
+	bool read_course_metadata(const pcsx2& ps2, uint32_t address, std::array<uint32_t, 64>& metadata)
+	{
+		ps2_ipc_cmd command(ps2);
+		std::array<ps2_ipc_cmd::queued_read<uint32_t>, 64> reads;
+		for (size_t i = 0; i < reads.size(); ++i)
+		{
+			reads[i] = command.queue_read<uint32_t>(address + static_cast<uint32_t>(i * sizeof(uint32_t)));
+		}
+		command.send();
+		for (size_t i = 0; i < reads.size(); ++i)
+			metadata[i] = command.read(reads[i]);
+
+		const auto filename_pointer = metadata[course_filename_pointer_index];
+		return filename_pointer >= course_filename_start && filename_pointer < course_filename_end;
+	}
+
 	void apply_course_redirect(const pcsx2& ps2)
 	{
-		const auto filename = course_filenames[selected_course];
-		ps2_ipc_cmd command(ps2);
-		for (const auto address : course_filename_addresses)
+		if (!original_course_metadata_saved)
 		{
-			for (uint32_t i = 0; i < 16; ++i)
-			{
-				command.write<uint8_t>(address + i, static_cast<uint8_t>(filename[i]));
-				if (filename[i] == '\0')
-				{
-					for (++i; i < 16; ++i)
-						command.write<uint8_t>(address + i, 0);
-					break;
-				}
-			}
+			if (!read_course_metadata(ps2, home_town_course_metadata, original_course_metadata))
+				return;
+			original_course_metadata_saved = true;
+		}
+
+		std::array<uint32_t, 64> target_metadata;
+		if (selected_course == 0)
+		{
+			target_metadata = original_course_metadata;
+		}
+		else if (!read_course_metadata(ps2, course_metadata_addresses[selected_course], target_metadata))
+		{
+			return;
+		}
+
+		ps2_ipc_cmd command(ps2);
+		for (size_t i = 0; i < target_metadata.size(); ++i)
+		{
+			command.write<uint32_t>(home_town_course_metadata + static_cast<uint32_t>(i * sizeof(uint32_t)), target_metadata[i]);
 		}
 		command.send();
 		course_redirect_applied = true;
@@ -291,12 +334,12 @@ public:
 		ImGui::Text("Motion: 0x%08X", motion_vector_address);
 
 		ImGui::Separator();
-		ImGui::Text("Home Town course archive redirect");
+		ImGui::Text("Experimental Home Town course redirect");
 		if (ImGui::Combo("Target course", &selected_course, course_names.data(), static_cast<int>(course_names.size())))
 			course_redirect_applied = false;
 		if (ImGui::Button("Apply Course Redirect"))
 			apply_course_redirect(ps2);
-		ImGui::TextWrapped("Apply outside a loaded course, then load Home Town. The original Home Town spawn metadata is retained and may place the rider out of bounds.");
+		ImGui::TextWrapped("Apply outside a loaded course, then load Home Town. This clones the target's complete course metadata record, including its existing filename and setup values. Home Town restores the record captured when the tool connected.");
 		if (course_redirect_applied)
 			ImGui::Text("Applied: %s", course_names[selected_course]);
 
@@ -320,7 +363,9 @@ public:
 			player_position_available = false;
 			position_editor_initialized = false;
 			motion_editor_initialized = false;
+			bookmark_available = false;
 			course_redirect_applied = false;
+			original_course_metadata_saved = false;
 		}
 
 		update_player_state(ps2);
