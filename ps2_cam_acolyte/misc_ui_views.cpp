@@ -46,7 +46,7 @@ const char* about_ui_view::selectable_name() const { return "About"; }
 void about_ui_view::draw_tool()
 {
 	ImGui::Text("Written by Moonless Formless and this version with some modification by Mikifriki ");
-	ImGui::Text("PS2 Cam Acolyte v%d.%02d", current_version.major, current_version.minor);
+	ImGui::Text("PS2 Cam Acolyte v%d.%d.%d", current_version.major, current_version.minor, current_version.patch);
     if (ImGui::Button("Check for Newer Version"))
     {
         OsOpenInShell("https://github.com/moonlessformless/ps2_cam_acolyte/releases");

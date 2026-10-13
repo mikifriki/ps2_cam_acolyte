@@ -25,6 +25,7 @@ private:
 	bool position_editor_initialized = false;
 	read_only_value_set<float, 3> camera_position;
 	bool camera_position_available = false;
+	read_only_value_set<uint32_t, 1> hud_values;
 
 	restoring_toggle_state<1> infinite_flag;
 	restoring_toggle_state<1> true_god_mode;
@@ -34,6 +35,8 @@ private:
 	static constexpr int position_x = 0;
 	static constexpr int position_y = 1;
 	static constexpr int position_z = 2;
+	static constexpr int hud_visibility = 0;
+	static constexpr uint32_t hud_flag_address = 0x004FC57C;
 	static constexpr int camera_fov_menu = 0;
 	static constexpr int camera_fov_regular = 1;
 	static constexpr int camera_fov_neg = 2;
@@ -140,7 +143,7 @@ private:
 		fly_enabled = mode_read.read(mode) == fly_mode;
 	}
 
-	// Retail USA retained debug-command wrapper. It submits FLY or DROP once
+	// Retail USA retained debug-command wrapper. It submits FLY, DROP or HUD once
 	// and restores the update hook after the game has returned from it.
 	static constexpr uint32_t debug_update_hook = 0x00135DC8;
 	static constexpr uint32_t debug_expected_hook = 0x0C075748;
@@ -150,6 +153,7 @@ private:
 	static constexpr uint32_t debug_completion_latch = 0x01FF0180;
 	static constexpr uint32_t fly_command = 0x00796C66; // "fly\\0"
 	static constexpr uint32_t drop_command = 0x706F7264; // "drop", followed by a zero word.
+	static constexpr uint32_t hud_command = 0x00647568; // "hud\\0"
 	static constexpr std::array<uint32_t, 30> debug_wrapper = { {
 		0x27BDFFD0, 0x7FBF0020, 0xAFA40000, 0x0C075748, 0x00000000,
 		0xAFA20004, 0x3C0801FF, 0x8D090180, 0x15200011, 0x00000000,
@@ -164,6 +168,7 @@ private:
 		idle,
 		waiting_for_fly,
 		waiting_for_drop,
+		waiting_for_hud,
 	};
 
 	debug_command_state debug_state = debug_command_state::idle;
@@ -212,8 +217,12 @@ private:
 		{
 			install.write<uint32_t>(debug_code_cave + static_cast<uint32_t>(i * sizeof(uint32_t)), debug_wrapper[i]);
 		}
-		install.write<uint32_t>(debug_command_buffer,
-			command == debug_command_state::waiting_for_drop ? drop_command : fly_command);
+		uint32_t command_text = fly_command;
+		if (command == debug_command_state::waiting_for_drop)
+			command_text = drop_command;
+		else if (command == debug_command_state::waiting_for_hud)
+			command_text = hud_command;
+		install.write<uint32_t>(debug_command_buffer, command_text);
 		install.write<uint32_t>(debug_command_buffer + sizeof(uint32_t), 0);
 		install.write<uint32_t>(debug_completion_latch, 0);
 		install.write<uint32_t>(debug_update_hook, debug_temporary_hook); // Install the hook last.
@@ -269,6 +278,7 @@ public:
 			0x00A6AE1C, // Rynn Z, float32
 		} })
 		, camera_position(ps2, static_cast<uint32_t>(0))
+		, hud_values(ps2, hud_flag_address)
 		, infinite_flag(ps2, {})
 		, infinite_bow_shooting(ps2, { {
 			0x00C4E604  // infinite shoot speed
@@ -340,17 +350,11 @@ public:
 			start_debug_command(ps2, debug_command_state::waiting_for_drop);
 		}
 		ImGui::EndDisabled();
-		ImGui::Text("DROP uses the flying camera position and offsets.");
 		if (!fly_enabled)
-			ImGui::Text("Enable Debug Fly to use DROP.");
+			ImGui::Text("Enable Debug Fly to use 'Dropp Rynn at Camera'.");
 
-		if (debug_state != debug_command_state::idle)
-		{
-			ImGui::Text(debug_state == debug_command_state::waiting_for_drop
-				? "Drop command waiting for active gameplay..."
-				: "Fly command waiting for active gameplay...");
-		}
-		else if (!fly_enabled)
+		ImGui::BeginDisabled(debug_state != debug_command_state::idle);
+		if (!fly_enabled)
 		{
 			if (ImGui::Button("Enable Debug Fly"))
 			{
@@ -364,11 +368,19 @@ public:
 				start_debug_command(ps2, debug_command_state::waiting_for_fly);
 			}
 		}
+		ImGui::EndDisabled();
 
 		ImGui::Separator();
 
 		if (debug_command_message != nullptr)
 			ImGui::TextUnformatted(debug_command_message);
+
+		ImGui::BeginDisabled(debug_state != debug_command_state::idle || !player_position_available);
+		if (ImGui::Button(hud_values.get(hud_visibility) != 0 ? "Hide HUD" : "Show HUD"))
+		{
+			start_debug_command(ps2, debug_command_state::waiting_for_hud);
+		}
+		ImGui::EndDisabled();
 
 		if (!position_editor_initialized && player_position_available)
 		{
@@ -472,6 +484,7 @@ public:
 
 		update_debug_command(ps2);
 		update_fly_mode(ps2);
+		hud_values.update();
 
 		if (infinite_bow_shooting.currently_tweaking()) {
 			infinite_bow_shooting.set(bow_shoot_speed, 1000.0f);
