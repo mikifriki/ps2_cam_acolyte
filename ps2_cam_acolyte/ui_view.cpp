@@ -18,7 +18,7 @@ void ui_main::render()
 
     bool debug_render_frames = false;
 
-    ImGui::Text("PS2 Cam Acolyte v%d.%02d", current_version.major, current_version.minor);
+    ImGui::Text("PS2 Cam Acolyte v%d.%d.%d", current_version.major, current_version.minor, current_version.patch);
     ImGui::SameLine();
     ImGui::Spacing();
     ImGui::SameLine();

@@ -4,6 +4,7 @@ struct version
 {
 	int major = 0;
 	int minor = 0;
+	int patch = 0;
 };
 
-static constexpr version current_version = { 0, 8 };
+static constexpr version current_version = { 0, 8, 5 };
