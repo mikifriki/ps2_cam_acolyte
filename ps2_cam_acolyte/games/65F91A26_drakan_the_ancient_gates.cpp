@@ -344,8 +344,6 @@ public:
 		if (!fly_enabled)
 			ImGui::Text("Enable Debug Fly to use DROP.");
 
-		ImGui::Separator();
-
 		if (debug_state != debug_command_state::idle)
 		{
 			ImGui::Text(debug_state == debug_command_state::waiting_for_drop
@@ -366,6 +364,8 @@ public:
 				start_debug_command(ps2, debug_command_state::waiting_for_fly);
 			}
 		}
+
+		ImGui::Separator();
 
 		if (debug_command_message != nullptr)
 			ImGui::TextUnformatted(debug_command_message);
