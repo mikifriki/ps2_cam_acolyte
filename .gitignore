@@ -385,3 +385,4 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+/ps2_cam_acolyte/ps2_cam_acolyte/x64/Release

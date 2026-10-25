@@ -8,7 +8,10 @@
 #include "glm/geometric.hpp"
 #include "glm/matrix.hpp"
 #include <array>
+#include <bit>
+#include <limits>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <iostream>
 
@@ -16,7 +19,7 @@ class drakan : public ps2_game
 {
 private:
 	sentinel_counter sentinel;
-	restoring_toggle_state<1> collision_flag;
+	restoring_toggle_state<5> collision_flag;
 	tweakable_value_set<float, 3> fov_values;
 	read_only_value_set<float, 3> player_position;
 	uint32_t player_position_address = 0;
@@ -29,6 +32,9 @@ private:
 
 	restoring_toggle_state<1> infinite_flag;
 	restoring_toggle_state<1> true_god_mode;
+	double jump_height = 1.0; // Pending input; typing does not change the game.
+	double jump_height_applied = 1.0;
+	bool jump_height_invalid = false;
 	tweakable_value_set<float, 1> infinite_bow_shooting;
 	tweakable_value_set<double, 1> infinite_bow_ammo;
 	float fov = 76.2722;
@@ -54,6 +60,24 @@ private:
 	static constexpr int bow_shoot_speed = 0;
 	static constexpr int bow_ammo = 0;
 	bool show_experimental_options = false;
+
+	void set_jump_height(const pcsx2& ps2, double multiplier)
+	{
+		// Height scales with launch velocity squared; gravity stays unchanged.
+		const double velocity = 2850.0 * std::sqrt(multiplier);
+		jump_height_invalid = !std::isfinite(multiplier) || multiplier <= 0.0 ||
+			velocity < std::numeric_limits<float>::min() || velocity > std::numeric_limits<float>::max();
+		if (jump_height_invalid)
+			return;
+		const uint32_t bits = std::bit_cast<uint32_t>(static_cast<float>(velocity));
+		ps2_ipc_cmd write(ps2);
+		write.write<uint32_t>(0x002FB3A4, 0x3C010000 | (bits >> 16));
+		write.write<uint32_t>(0x002FB3A8, 0x34210000 | (bits & 0xFFFF));
+		write.send();
+		sentinel.increment();
+		jump_height = multiplier;
+		jump_height_applied = multiplier;
+	}
 
 	bool update_player_position(const pcsx2& ps2)
 	{
@@ -267,7 +291,11 @@ public:
 	explicit drakan(const pcsx2& ps2)
 		: sentinel(ps2, 0x01000000)
 		, collision_flag(ps2, { {
-			{ 0x0017F920, 0x00000000, 0x02242021 }	// Disable collision. (causes rynn to flicker currently from time to time)
+			{ 0x002354F8, 0x44801800, 0x460018C7 }, // Zero movement correction X.
+			{ 0x00235514, 0x44801000, 0x46001087 }, // Zero movement correction Z.
+			{ 0x0023551C, 0x44800800, 0x46000847 }, // Zero movement correction Y.
+			{ 0x00235558, 0x10000005, 0x0C08D5B4 }, // Skip both collision solver passes.
+			{ 0x00281778, 0x10000093, 0x14400093 }  // Bypass Arokh environment response.
 		} })
 		, fov_values(ps2, { 
 			 { 0x006C65E0, 0x06C668C, 0x006C6674 },
@@ -289,6 +317,7 @@ public:
 		, true_god_mode(ps2, { {
 			{ 0x003D5530, 0x03E00008, 0x00A0302D }	// True god mode. Ignores fall damage.
 		} })
+
 	{
 	}
 
@@ -296,11 +325,34 @@ public:
 	{
 		ImGui::Text("game running.");
 
+		auto coordinate = [](const char* label, float value)
+		{
+			char text[64];
+			std::snprintf(text, sizeof(text), "%.3f", value);
+
+			ImGui::PushID(label);
+			ImGui::BeginGroup();
+			ImGui::Text("%c:", label[0]);
+			ImGui::SameLine(0.0f, ImGui::CalcTextSize(" ").x);
+
+			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+			ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+			ImGui::SetNextItemWidth(ImGui::CalcTextSize(text).x + 1.0f);
+			ImGui::InputText("##value", text, sizeof(text),
+				ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoHorizontalScroll);
+			ImGui::PopStyleColor();
+			ImGui::PopStyleVar(2);
+
+			ImGui::EndGroup();
+			ImGui::PopID();
+		};
+
 		ImGui::Separator();
 		ImGui::Text("Rynn world position");
-		ImGui::Text("X: %.3f", player_position.get(position_x));
-		ImGui::Text("Y: %.3f", player_position.get(position_y));
-		ImGui::Text("Z: %.3f", player_position.get(position_z));
+		coordinate("X##rynn", player_position.get(position_x));
+		coordinate("Y##rynn", player_position.get(position_y));
+		coordinate("Z##rynn", player_position.get(position_z));
 
 		ImGui::Text("Set Rynn world position");
 		ImGui::InputFloat("Set X", &position_edit[position_x], 0.0f, 0.0f, "%.3f");
@@ -334,9 +386,9 @@ public:
 		ImGui::Text("Camera world position");
 		if (camera_position_available)
 		{
-			ImGui::Text("X: %.3f", camera_position.get(position_x));
-			ImGui::Text("Y: %.3f", camera_position.get(position_y));
-			ImGui::Text("Z: %.3f", camera_position.get(position_z));
+			coordinate("X##camera", camera_position.get(position_x));
+			coordinate("Y##camera", camera_position.get(position_y));
+			coordinate("Z##camera", camera_position.get(position_z));
 		}
 		else
 		{
@@ -351,7 +403,7 @@ public:
 		}
 		ImGui::EndDisabled();
 		if (!fly_enabled)
-			ImGui::Text("Enable Debug Fly to use 'Dropp Rynn at Camera'.");
+			ImGui::Text("Enable Debug Fly to use 'Drop Rynn at Camera'.");
 
 		ImGui::BeginDisabled(debug_state != debug_command_state::idle);
 		if (!fly_enabled)
@@ -371,6 +423,8 @@ public:
 		ImGui::EndDisabled();
 
 		ImGui::Separator();
+
+		ImGui::Text("Miscellaneous");
 
 		if (debug_command_message != nullptr)
 			ImGui::TextUnformatted(debug_command_message);
@@ -396,7 +450,30 @@ public:
 			sentinel.increment();
 		} ImGui::SameLine();		
 
+
+		ImGui::SetNextItemWidth(160.0f);
 		ImGui::SliderFloat("", &fov, 20.0f, 180.0f, "%.2f");
+
+		ImGui::Separator();
+
+		ImGui::PushID("jump_height");
+		ImGui::SetNextItemWidth(160.0f);
+		ImGui::InputDouble("Jump height", &jump_height,
+			0.0, 0.0, "%.6g");
+		if (ImGui::Button("Apply"))
+			set_jump_height(ps2, jump_height);
+		ImGui::SameLine();
+		if (ImGui::Button("\xC3\x97" "2 & Apply"))
+			set_jump_height(ps2, jump_height * 2.0);
+		ImGui::SameLine();
+		if (ImGui::Button("Reset to 1\xC3\x97"))
+			set_jump_height(ps2, 1.0);
+		ImGui::Text("Applied: %.6g\xC3\x97%s", jump_height_applied,
+			jump_height != jump_height_applied ? " (unapplied edit)" : "");
+		ImGui::TextUnformatted("Click Apply to use your value.");
+		if (jump_height_invalid)
+			ImGui::TextUnformatted("Number invalid");
+		ImGui::PopID();
 
 		if (!collision_flag.is_on())
 		{
@@ -474,6 +551,7 @@ public:
 			fov_values.reset();
 			infinite_flag.reset();
 			true_god_mode.reset();
+			set_jump_height(ps2, 1.0);
 			infinite_bow_shooting.reset();
 			infinite_bow_ammo.reset();
 			debug_state = debug_command_state::idle;
