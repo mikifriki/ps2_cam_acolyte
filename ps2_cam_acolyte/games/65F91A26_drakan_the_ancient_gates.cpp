@@ -61,6 +61,133 @@ private:
 	static constexpr int bow_ammo = 0;
 	bool show_experimental_options = false;
 
+	static constexpr std::array<uint32_t, 5> camera_speed_addresses = {
+		0x002A34B0, 0x002A34E0, 0x002A3500, 0x002A3528, 0x002A3548
+	};
+	static constexpr std::array<float, 7> camera_speed_presets = {
+		0.125f, 0.25f, 0.5f, 1.0f, 2.0f, 4.0f, 8.0f
+	};
+	float camera_speed_multiplier = 1.0f;
+	bool camera_speed_available = false;
+	const char* camera_speed_message = nullptr;
+
+	static std::array<uint32_t, 10> camera_speed_words(float multiplier)
+	{
+		std::array<uint32_t, 10> words;
+		for (size_t i = 0; i < camera_speed_addresses.size(); ++i)
+		{
+			const float sign = (i == 0 || i == 2 || i == 4) ? -1.0f : 1.0f;
+			const uint32_t bits = std::bit_cast<uint32_t>(sign * 20000.0f * multiplier);
+			words[i * 2] = 0x3C010000 | (bits >> 16);
+			words[i * 2 + 1] = 0x34210000 | (bits & 0xFFFF);
+		}
+		return words;
+	}
+
+	float read_camera_speed(const pcsx2& ps2)
+	{
+		ps2_ipc_cmd read(ps2);
+		std::array<ps2_ipc_cmd::queued_read<uint32_t>, 10> queued;
+		for (size_t i = 0; i < camera_speed_addresses.size(); ++i)
+		{
+			queued[i * 2] = read.queue_read<uint32_t>(camera_speed_addresses[i]);
+			queued[i * 2 + 1] = read.queue_read<uint32_t>(camera_speed_addresses[i] + 4);
+		}
+		read.send();
+		std::array<uint32_t, 10> words;
+		for (size_t i = 0; i < words.size(); ++i)
+			words[i] = read.read(queued[i]);
+		// Accept only complete retail/preset fingerprints, including a preset
+		// restored by a save state or left by an earlier Acolyte connection.
+		for (float preset : camera_speed_presets)
+			if (words == camera_speed_words(preset))
+				return preset;
+		return 0.0f;
+	}
+
+	bool set_camera_speed(const pcsx2& ps2, float multiplier)
+	{
+		bool supported = false;
+		for (float preset : camera_speed_presets)
+			supported |= multiplier == preset;
+		if (!supported || (multiplier != 1.0f && !fly_enabled))
+			return false;
+
+		const float current = read_camera_speed(ps2);
+		if (current == 0.0f)
+		{
+			camera_speed_available = false;
+			camera_speed_message = "Camera speed unavailable: movement code has changed.";
+			return false;
+		}
+		if (current != multiplier)
+		{
+			const auto words = camera_speed_words(multiplier);
+			ps2_ipc_cmd write(ps2);
+			for (size_t i = 0; i < camera_speed_addresses.size(); ++i)
+			{
+				write.write<uint32_t>(camera_speed_addresses[i], words[i * 2]);
+				write.write<uint32_t>(camera_speed_addresses[i] + 4, words[i * 2 + 1]);
+			}
+			write.send();
+			if (read_camera_speed(ps2) != multiplier)
+			{
+				camera_speed_available = false;
+				camera_speed_message = "Camera speed change could not be confirmed.";
+				return false;
+			}
+			sentinel.increment();
+		}
+		camera_speed_multiplier = multiplier;
+		camera_speed_available = true;
+		camera_speed_message = nullptr;
+		return true;
+	}
+
+	void update_camera_speed(const pcsx2& ps2)
+	{
+		const float current = read_camera_speed(ps2);
+		camera_speed_available = current != 0.0f;
+		if (!camera_speed_available)
+		{
+			camera_speed_message = "Camera speed unavailable: movement code has changed.";
+			return;
+		}
+		camera_speed_multiplier = current;
+		camera_speed_message = nullptr;
+		if (!fly_enabled && current != 1.0f)
+			set_camera_speed(ps2, 1.0f);
+	}
+
+	void draw_camera_speed_ui(const pcsx2& ps2)
+	{
+		ImGui::PushID("camera_speed");
+		if (camera_speed_available)
+			ImGui::Text("Camera speed: %.3gx", camera_speed_multiplier);
+		else
+			ImGui::TextUnformatted("Camera speed unavailable");
+		ImGui::BeginDisabled(!fly_enabled || !camera_speed_available ||
+			debug_state != debug_command_state::idle);
+		ImGui::BeginDisabled(camera_speed_multiplier <= camera_speed_presets.front());
+		if (ImGui::Button("Decrease speed"))
+			set_camera_speed(ps2, camera_speed_multiplier * 0.5f);
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		ImGui::BeginDisabled(camera_speed_multiplier >= camera_speed_presets.back());
+		if (ImGui::Button("Increase speed"))
+			set_camera_speed(ps2, camera_speed_multiplier * 2.0f);
+		ImGui::EndDisabled();
+		ImGui::SameLine();
+		if (ImGui::Button("Reset speed"))
+			set_camera_speed(ps2, 1.0f);
+		ImGui::EndDisabled();
+		if (!fly_enabled)
+			ImGui::TextUnformatted("Enable Debug Fly to adjust camera speed.");
+		if (camera_speed_message != nullptr)
+			ImGui::TextUnformatted(camera_speed_message);
+		ImGui::PopID();
+	}
+
 	void set_jump_height(const pcsx2& ps2, double multiplier)
 	{
 		// Height scales with launch velocity squared; gravity stays unchanged.
@@ -424,6 +551,9 @@ public:
 
 		ImGui::Separator();
 
+		draw_camera_speed_ui(ps2);
+		ImGui::Separator();
+
 		ImGui::Text("Miscellaneous");
 
 		if (debug_command_message != nullptr)
@@ -552,6 +682,7 @@ public:
 			infinite_flag.reset();
 			true_god_mode.reset();
 			set_jump_height(ps2, 1.0);
+			set_camera_speed(ps2, 1.0f);
 			infinite_bow_shooting.reset();
 			infinite_bow_ammo.reset();
 			debug_state = debug_command_state::idle;
@@ -562,6 +693,7 @@ public:
 
 		update_debug_command(ps2);
 		update_fly_mode(ps2);
+		update_camera_speed(ps2);
 		hud_values.update();
 
 		if (infinite_bow_shooting.currently_tweaking()) {
