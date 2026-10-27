@@ -689,6 +689,219 @@ private:
 		debug_state = debug_command_state::idle;
 	}
 
+	static void draw_coordinate(const char* label, float value)
+	{
+		char text[64];
+		std::snprintf(text, sizeof(text), "%.3f", value);
+
+		ImGui::PushID(label);
+		ImGui::BeginGroup();
+		ImGui::Text("%c:", label[0]);
+		ImGui::SameLine(0.0f, ImGui::CalcTextSize(" ").x);
+
+		ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+		ImGui::SetNextItemWidth(ImGui::CalcTextSize(text).x + 1.0f);
+		ImGui::InputText("##value", text, sizeof(text),
+			ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoHorizontalScroll);
+		ImGui::PopStyleColor();
+		ImGui::PopStyleVar(2);
+
+		ImGui::EndGroup();
+		ImGui::PopID();
+	}
+
+	void initialize_position_editor()
+	{
+		if (!position_editor_initialized && player_position_available)
+		{
+			position_edit[position_x] = player_position.get(position_x);
+			position_edit[position_y] = player_position.get(position_y);
+			position_edit[position_z] = player_position.get(position_z);
+			position_editor_initialized = true;
+		}
+	}
+
+	void draw_debug_command_message() const
+	{
+		if (debug_command_message != nullptr)
+			ImGui::TextUnformatted(debug_command_message);
+	}
+
+	void draw_rynn_position_ui(const pcsx2& ps2)
+	{
+		if (!ImGui::CollapsingHeader("Rynn position", ImGuiTreeNodeFlags_DefaultOpen))
+			return;
+
+		ImGui::Text("Rynn world position");
+		draw_coordinate("X##rynn", player_position.get(position_x));
+		draw_coordinate("Y##rynn", player_position.get(position_y));
+		draw_coordinate("Z##rynn", player_position.get(position_z));
+
+		ImGui::Text("Set Rynn world position");
+		ImGui::InputFloat("X", &position_edit[position_x], 0.0f, 0.0f, "%.3f");
+		ImGui::InputFloat("Y", &position_edit[position_y], 0.0f, 0.0f, "%.3f");
+		ImGui::InputFloat("Z", &position_edit[position_z], 0.0f, 0.0f, "%.3f");
+
+		if (ImGui::Button("Apply Position"))
+		{
+			if (player_position_available &&
+				std::isfinite(position_edit[position_x]) &&
+				std::isfinite(position_edit[position_y]) &&
+				std::isfinite(position_edit[position_z]))
+			{
+				ps2_ipc_cmd cmd(ps2);
+				cmd.write<float>(player_position_address + (position_x * sizeof(float)), position_edit[position_x]);
+				cmd.write<float>(player_position_address + (position_y * sizeof(float)), position_edit[position_y]);
+				cmd.write<float>(player_position_address + (position_z * sizeof(float)), position_edit[position_z]);
+				cmd.send();
+			}
+		}
+		ImGui::SameLine();
+		if (ImGui::Button("Use Current Position"))
+		{
+			position_edit[position_x] = player_position.get(position_x);
+			position_edit[position_y] = player_position.get(position_y);
+			position_edit[position_z] = player_position.get(position_z);
+		}
+	}
+
+	void draw_camera_ui(const pcsx2& ps2)
+	{
+		if (!ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen))
+			return;
+
+		ImGui::Text("Debug Fly: %s", fly_enabled ? "On" : "Off");
+		ImGui::SameLine();
+		ImGui::BeginDisabled(debug_state != debug_command_state::idle);
+		if (ImGui::Button(fly_enabled ? "Disable Debug Fly" : "Enable Debug Fly"))
+			start_debug_command(ps2, debug_command_state::waiting_for_fly);
+		ImGui::EndDisabled();
+
+		draw_camera_speed_ui(ps2);
+		ImGui::Separator();
+
+		ImGui::Text("Camera world position");
+		if (camera_position_available)
+		{
+			draw_coordinate("X##camera", camera_position.get(position_x));
+			draw_coordinate("Y##camera", camera_position.get(position_y));
+			draw_coordinate("Z##camera", camera_position.get(position_z));
+		}
+		else
+		{
+			ImGui::Text("Camera position unavailable.");
+		}
+
+		ImGui::BeginDisabled(!fly_enabled || !player_position_available ||
+			!camera_position_available || debug_state != debug_command_state::idle);
+		if (ImGui::Button("Drop Rynn at Camera"))
+		{
+			start_debug_command(ps2, debug_command_state::waiting_for_drop);
+		}
+		ImGui::EndDisabled();
+		if (!fly_enabled)
+			ImGui::Text("Enable Debug Fly to use 'Drop Rynn at Camera'.");
+	}
+
+	void draw_fov_ui()
+	{
+		bool override_fov = fov_values.currently_tweaking();
+		if (ImGui::Checkbox("Override field of view", &override_fov))
+		{
+			fov_values.toggle_tweaking();
+			sentinel.increment();
+		}
+		ImGui::BeginDisabled(!fov_values.currently_tweaking());
+		ImGui::SetNextItemWidth(240.0f);
+		ImGui::SliderFloat("Field of view (degrees)", &fov, 20.0f, 180.0f, "%.2f");
+		ImGui::EndDisabled();
+	}
+
+	void draw_view_settings_ui(const pcsx2& ps2)
+	{
+		if (!ImGui::CollapsingHeader("View settings", ImGuiTreeNodeFlags_DefaultOpen))
+			return;
+
+		ImGui::BeginDisabled(debug_state != debug_command_state::idle || !player_position_available);
+		if (ImGui::Button(hud_values.get(hud_visibility) != 0 ? "Hide HUD" : "Show HUD"))
+		{
+			start_debug_command(ps2, debug_command_state::waiting_for_hud);
+		}
+		ImGui::EndDisabled();
+
+		draw_fov_ui();
+		draw_render_distance_ui(ps2);
+	}
+
+	void draw_jump_height_ui(const pcsx2& ps2)
+	{
+		ImGui::PushID("jump_height");
+		ImGui::SetNextItemWidth(160.0f);
+		ImGui::InputDouble("Jump height", &jump_height,
+			0.0, 0.0, "%.6g");
+		if (ImGui::Button("Apply"))
+			set_jump_height(ps2, jump_height);
+		ImGui::SameLine();
+		if (ImGui::Button("\xC3\x97" "2 & Apply"))
+			set_jump_height(ps2, jump_height * 2.0);
+		ImGui::SameLine();
+		if (ImGui::Button("Reset to 1\xC3\x97"))
+			set_jump_height(ps2, 1.0);
+		ImGui::Text("Applied: %.6g\xC3\x97%s", jump_height_applied,
+			jump_height != jump_height_applied ? " (unapplied edit)" : "");
+		ImGui::TextUnformatted("Click Apply to use your value.");
+		if (jump_height_invalid)
+			ImGui::TextUnformatted("Number invalid");
+		ImGui::PopID();
+	}
+
+	void draw_experimental_ui()
+	{
+		ImGui::Checkbox("Enable Experiments", &show_experimental_options);
+		if (show_experimental_options)
+		{
+			ImGui::Separator();
+
+			if (ImGui::Button(infinite_flag.is_on() ?
+				"Disable infinite bow ammo/shoot speed" : "Enable infinite bow ammo/shoot speed"))
+			{
+				infinite_flag.toggle();
+				infinite_bow_shooting.toggle_tweaking();
+				infinite_bow_ammo.toggle_tweaking();
+				sentinel.increment();
+			}
+		}
+	}
+
+	void draw_gameplay_ui(const pcsx2& ps2)
+	{
+		if (!ImGui::CollapsingHeader("Gameplay", ImGuiTreeNodeFlags_DefaultOpen))
+			return;
+
+		draw_jump_height_ui(ps2);
+		ImGui::Separator();
+
+		ImGui::Text("Collision: %s", collision_flag.is_on() ? "Off" : "On");
+		ImGui::SameLine();
+		if (ImGui::Button(collision_flag.is_on() ? "Enable Collision" : "Disable Collision"))
+		{
+			collision_flag.toggle();
+			sentinel.increment();
+		}
+
+		ImGui::Text("God mode: %s", true_god_mode.is_on() ? "On" : "Off");
+		ImGui::SameLine();
+		if (ImGui::Button(true_god_mode.is_on() ? "Disable True God mode" : "Enable True God mode"))
+		{
+			true_god_mode.toggle();
+			sentinel.increment();
+		}
+
+		draw_experimental_ui();
+	}
+
 public:
 	explicit drakan(const pcsx2& ps2)
 		: sentinel(ps2, 0x01000000)
@@ -725,172 +938,12 @@ public:
 
 	void draw_game_ui(const pcsx2& ps2, const controller& c, playback& camera_playback) override
 	{
-		ImGui::Text("game running.");
-
-		auto coordinate = [](const char* label, float value)
-		{
-			char text[64];
-			std::snprintf(text, sizeof(text), "%.3f", value);
-
-			ImGui::PushID(label);
-			ImGui::BeginGroup();
-			ImGui::Text("%c:", label[0]);
-			ImGui::SameLine(0.0f, ImGui::CalcTextSize(" ").x);
-
-			ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
-			ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 0.0f);
-			ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-			ImGui::SetNextItemWidth(ImGui::CalcTextSize(text).x + 1.0f);
-			ImGui::InputText("##value", text, sizeof(text),
-				ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoHorizontalScroll);
-			ImGui::PopStyleColor();
-			ImGui::PopStyleVar(2);
-
-			ImGui::EndGroup();
-			ImGui::PopID();
-		};
-
-		ImGui::Separator();
-		ImGui::Text("Rynn world position");
-		coordinate("X##rynn", player_position.get(position_x));
-		coordinate("Y##rynn", player_position.get(position_y));
-		coordinate("Z##rynn", player_position.get(position_z));
-
-		ImGui::Text("Set Rynn world position");
-		ImGui::InputFloat("X", &position_edit[position_x], 0.0f, 0.0f, "%.3f");
-		ImGui::InputFloat("Y", &position_edit[position_y], 0.0f, 0.0f, "%.3f");
-		ImGui::InputFloat("Z", &position_edit[position_z], 0.0f, 0.0f, "%.3f");
-
-		if (ImGui::Button("Apply Position"))
-		{
-			if (player_position_available &&
-				std::isfinite(position_edit[position_x]) &&
-				std::isfinite(position_edit[position_y]) &&
-				std::isfinite(position_edit[position_z]))
-			{
-				ps2_ipc_cmd cmd(ps2);
-				cmd.write<float>(player_position_address + (position_x * sizeof(float)), position_edit[position_x]);
-				cmd.write<float>(player_position_address + (position_y * sizeof(float)), position_edit[position_y]);
-				cmd.write<float>(player_position_address + (position_z * sizeof(float)), position_edit[position_z]);
-				cmd.send();
-			}
-		}
-		ImGui::SameLine();
-		if (ImGui::Button("Use Current Position"))
-		{
-			position_edit[position_x] = player_position.get(position_x);
-			position_edit[position_y] = player_position.get(position_y);
-			position_edit[position_z] = player_position.get(position_z);
-		}
-
-		ImGui::Separator();
-
-		ImGui::Text("Camera world position");
-		if (camera_position_available)
-		{
-			coordinate("X##camera", camera_position.get(position_x));
-			coordinate("Y##camera", camera_position.get(position_y));
-			coordinate("Z##camera", camera_position.get(position_z));
-		}
-		else
-		{
-			ImGui::Text("Camera position unavailable.");
-		}
-
-		ImGui::BeginDisabled(!fly_enabled || !player_position_available ||
-			!camera_position_available || debug_state != debug_command_state::idle);
-		if (ImGui::Button("Drop Rynn at Camera"))
-		{
-			start_debug_command(ps2, debug_command_state::waiting_for_drop);
-		}
-		ImGui::EndDisabled();
-		if (!fly_enabled)
-			ImGui::Text("Enable Debug Fly to use 'Drop Rynn at Camera'.");
-
-		ImGui::BeginDisabled(debug_state != debug_command_state::idle);
-		if (ImGui::Button(fly_enabled ? "Disable Debug Fly" : "Enable Debug Fly"))
-			start_debug_command(ps2, debug_command_state::waiting_for_fly);
-		ImGui::EndDisabled();
-
-		draw_camera_speed_ui(ps2);
-		ImGui::Separator();
-
-		if (debug_command_message != nullptr)
-			ImGui::TextUnformatted(debug_command_message);
-
-		if (!position_editor_initialized && player_position_available)
-		{
-			position_edit[position_x] = player_position.get(position_x);
-			position_edit[position_y] = player_position.get(position_y);
-			position_edit[position_z] = player_position.get(position_z);
-			position_editor_initialized = true;
-		}	
-
-		draw_render_distance_ui(ps2);
-
-		ImGui::Separator();
-		ImGui::Text("Miscellaneous");
-
-		if (ImGui::Button(collision_flag.is_on() ? "Enable Collision" : "Disable Collision"))
-		{
-			collision_flag.toggle();
-			sentinel.increment();
-		}
-
-		if (ImGui::Button(true_god_mode.is_on() ? "Disable True God mode" : "Enable True God mode"))
-		{
-			true_god_mode.toggle();
-			sentinel.increment();
-		}
-
-		ImGui::BeginDisabled(debug_state != debug_command_state::idle || !player_position_available);
-		if (ImGui::Button(hud_values.get(hud_visibility) != 0 ? "Hide HUD" : "Show HUD"))
-		{
-			start_debug_command(ps2, debug_command_state::waiting_for_hud);
-		}
-		ImGui::EndDisabled();
-
-		ImGui::SetNextItemWidth(160.0f);
-		ImGui::SliderFloat("", &fov, 20.0f, 180.0f, "%.2f");
-		if (ImGui::Button("Modify FOV"))
-		{
-			fov_values.toggle_tweaking();
-			sentinel.increment();
-		} ImGui::SameLine();
-
-		ImGui::PushID("jump_height");
-		ImGui::SetNextItemWidth(160.0f);
-		ImGui::InputDouble("Jump height", &jump_height,
-			0.0, 0.0, "%.6g");
-		if (ImGui::Button("Apply"))
-			set_jump_height(ps2, jump_height);
-		ImGui::SameLine();
-		if (ImGui::Button("\xC3\x97" "2 & Apply"))
-			set_jump_height(ps2, jump_height * 2.0);
-		ImGui::SameLine();
-		if (ImGui::Button("Reset to 1\xC3\x97"))
-			set_jump_height(ps2, 1.0);
-		ImGui::Text("Applied: %.6g\xC3\x97%s", jump_height_applied,
-			jump_height != jump_height_applied ? " (unapplied edit)" : "");
-		ImGui::TextUnformatted("Click Apply to use your value.");
-		if (jump_height_invalid)
-			ImGui::TextUnformatted("Number invalid");
-		ImGui::PopID();
-
-		ImGui::Checkbox("Enable Experiments", &show_experimental_options);
-		if (show_experimental_options)
-		{
-			ImGui::Separator();
-
-			if (ImGui::Button(infinite_flag.is_on() ?
-				"Disable infinite bow ammo/shoot speed" : "Enable infinite bow ammo/shoot speed"))
-			{
-				infinite_flag.toggle();
-				infinite_bow_shooting.toggle_tweaking();
-				infinite_bow_ammo.toggle_tweaking();
-				sentinel.increment();
-			}
-		}
+		initialize_position_editor();
+		draw_debug_command_message();
+		draw_rynn_position_ui(ps2);
+		draw_camera_ui(ps2);
+		draw_view_settings_ui(ps2);
+		draw_gameplay_ui(ps2);
 	}
 
 	void update(const pcsx2& ps2, const controller_state& c, playback& camera_playback, float time_delta) override
