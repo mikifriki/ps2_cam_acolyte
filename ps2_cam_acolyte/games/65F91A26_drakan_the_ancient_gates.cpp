@@ -188,6 +188,305 @@ private:
 		ImGui::PopID();
 	}
 
+	float render_distance = 0.0f;
+	float render_distance_edit = 0.0f;
+	float render_distance_default = 0.0f;
+	uint32_t render_manager_address = 0;
+	uint32_t render_camera_address = 0;
+	uint32_t render_level_properties = 0;
+	bool render_distance_available = false;
+	bool render_distance_editor_initialized = false;
+	float render_fog_width = 0.0f;
+	const char* render_distance_message = nullptr;
+	static constexpr uint32_t view_camera_global = 0x00555A48;
+	static constexpr uint32_t level_properties_offset = 0x4C0;
+	static constexpr float world_units_per_lu = 2048.0f;
+	struct sector_instruction
+	{
+		uint32_t address;
+		uint32_t original;
+		uint32_t extended;
+	};
+	// Consider every terrain sector, then let the game's distance and frustum checks filter them.
+	static constexpr std::array<sector_instruction, 4> terrain_sector_patch = {{
+		{ 0x00152428, 0x8C7E0078, 0x8EDE0010 }, // Use the total sector count.
+		{ 0x001524EC, 0x8C430070, 0x00000000 }, // Skip the current sector's candidate list.
+		{ 0x001524F0, 0x00641821, 0x00000000 },
+		{ 0x001524F4, 0x94620000, 0x0200102D }, // Use the loop index as the sector ID.
+	}};
+
+	std::array<uint32_t, 4> read_terrain_sector_code(const pcsx2& ps2) const
+	{
+		ps2_ipc_cmd read(ps2);
+		std::array<ps2_ipc_cmd::queued_read<uint32_t>, 4> words;
+		for (size_t i = 0; i < words.size(); ++i)
+			words[i] = read.queue_read<uint32_t>(terrain_sector_patch[i].address);
+		read.send();
+		std::array<uint32_t, 4> code;
+		for (size_t i = 0; i < code.size(); ++i)
+			code[i] = read.read(words[i]);
+		return code;
+	}
+
+	static bool valid_ee_address(uint32_t address, uint32_t size)
+	{
+		return size <= 0x02000000 && address >= 0x00100000 && address % 4 == 0 &&
+			address <= 0x02000000 - size;
+	}
+
+	static bool valid_render_distance(float distance)
+	{
+		return std::isfinite(distance) && distance > 32.0f && distance <= 10000000.0f;
+	}
+
+	template<typename T>
+	static T read_ee_value(const pcsx2& ps2, uint32_t address)
+	{
+		ps2_ipc_cmd read(ps2);
+		auto value = read.queue_read<T>(address);
+		read.send();
+		return read.read(value);
+	}
+
+	static bool valid_distance_and_fog(float distance, float width)
+	{
+		return valid_render_distance(distance) && std::isfinite(width) &&
+			width > 0.0f && width <= distance;
+	}
+
+	// Property 92 is the loaded level's Max Fog Depth, in level units.
+	// Sparse overrides fall back to the level's full property array.
+	float read_default_render_distance(const pcsx2& ps2, uint32_t properties) const
+	{
+		if (!valid_ee_address(properties, 4))
+			return 0.0f;
+		auto object = read_ee_value<uint32_t>(ps2, properties);
+		for (int depth = 0; depth < 4 && valid_ee_address(object, 24); ++depth)
+		{
+			ps2_ipc_cmd header_read(ps2);
+			std::array<ps2_ipc_cmd::queued_read<uint32_t>, 6> header;
+			for (size_t i = 0; i < header.size(); ++i)
+				header[i] = header_read.queue_read<uint32_t>(object + static_cast<uint32_t>(i * 4));
+			header_read.send();
+			const auto count = header_read.read(header[0]);
+			const auto values = header_read.read(header[1]);
+			const auto vtable = header_read.read(header[2]);
+			uint32_t value_address = 0;
+			if (vtable == 0x0051B0D0 && count > 92 && count <= 1024 &&
+				valid_ee_address(values, count * 4))
+			{
+				value_address = values + 92 * 4;
+			}
+			else if (vtable == 0x0051B098)
+			{
+				const auto override_count = header_read.read(header[4]);
+				const auto indices = header_read.read(header[5]);
+				if (override_count > 128 || (override_count != 0 &&
+					(!valid_ee_address(indices, override_count * 2) ||
+					 !valid_ee_address(values, override_count * 4))))
+					return 0.0f;
+				if (override_count != 0)
+				{
+					ps2_ipc_cmd indices_read(ps2);
+					std::array<ps2_ipc_cmd::queued_read<uint16_t>, 128> entries;
+					for (uint32_t i = 0; i < override_count; ++i)
+						entries[i] = indices_read.queue_read<uint16_t>(indices + i * 2);
+					indices_read.send();
+					for (uint32_t i = 0; i < override_count; ++i)
+						if (indices_read.read(entries[i]) == 92)
+							value_address = values + i * 4;
+				}
+				object = header_read.read(header[3]);
+			}
+			else
+				return 0.0f;
+			if (value_address != 0)
+			{
+				const float distance = read_ee_value<int32_t>(ps2, value_address) * world_units_per_lu;
+				return valid_render_distance(distance) ? distance : 0.0f;
+			}
+		}
+		return 0.0f;
+	}
+
+	void update_render_distance(const pcsx2& ps2)
+	{
+		render_distance_available = false;
+		ps2_ipc_cmd pointers_read(ps2);
+		auto manager = pointers_read.queue_read<uint32_t>(manager_global);
+		auto camera = pointers_read.queue_read<uint32_t>(view_camera_global);
+		pointers_read.send();
+		const auto manager_address = pointers_read.read(manager);
+		const auto camera_address = pointers_read.read(camera);
+		if (!player_position_available || !valid_ee_address(manager_address, 0x524) ||
+			!valid_ee_address(camera_address, 0xD8))
+		{
+			render_level_properties = 0;
+			render_distance_default = 0.0f;
+			render_distance_editor_initialized = false;
+			return;
+		}
+
+		ps2_ipc_cmd values_read(ps2);
+		auto far_distance = values_read.queue_read<float>(manager_address + 0x394);
+		auto fog_width = values_read.queue_read<float>(manager_address + 0x3A8);
+		auto properties = values_read.queue_read<uint32_t>(manager_address + level_properties_offset);
+		values_read.send();
+		const float distance = values_read.read(far_distance);
+		const float width = values_read.read(fog_width);
+		if (!valid_distance_and_fog(distance, width))
+		{
+			render_distance_default = 0.0f;
+			render_distance_editor_initialized = false;
+			return;
+		}
+
+		const auto level_properties = values_read.read(properties);
+		const bool level_changed = manager_address != render_manager_address ||
+			level_properties != render_level_properties;
+		if (level_changed || render_distance_default <= 0.0f)
+			render_distance_default = read_default_render_distance(ps2, level_properties);
+		if (level_changed)
+		{
+			render_distance_editor_initialized = false;
+			render_distance_message = nullptr;
+		}
+		render_manager_address = manager_address;
+		render_camera_address = camera_address;
+		render_level_properties = level_properties;
+		render_distance = distance;
+		render_fog_width = width;
+		render_distance_available = true;
+		if (!render_distance_editor_initialized)
+		{
+			render_distance_edit = distance;
+			render_distance_editor_initialized = true;
+		}
+	}
+
+	struct distance_field
+	{
+		uint32_t offset;
+		float value;
+	};
+
+	static bool make_render_distance_values(float distance, float current_distance,
+		float current_width, std::array<distance_field, 10>& fields)
+	{
+		if (!valid_render_distance(distance) || !valid_distance_and_fog(current_distance, current_width))
+			return false;
+		const float width = distance * (current_width / current_distance);
+		const float start = distance - width;
+		const float distance_squared = distance * distance;
+		const float start_squared = start * start;
+		const float squared_span = distance_squared - start_squared;
+		if (width <= 0.0f || squared_span <= 0.0f ||
+			!std::isfinite(1.0f / width) || !std::isfinite(1.0f / squared_span))
+			return false;
+
+		// Update main distance and fog settings; leave secondary distance unchanged.
+		fields = {{
+			{ 0x388, distance / world_units_per_lu },
+			{ 0x38C, distance_squared },
+			{ 0x394, distance },
+			{ 0x398, start_squared },
+			{ 0x39C, distance_squared },
+			{ 0x3A0, 1.0f / squared_span },
+			{ 0x3A4, distance },
+			{ 0x3A8, width },
+			{ 0x3AC, 1.0f / width },
+			{ 0x3B0, start },
+		}};
+		return true;
+	}
+
+	enum class distance_action { apply, double_current, reset };
+
+	void apply_render_distance(const pcsx2& ps2, float distance, distance_action action = distance_action::apply)
+	{
+		update_render_distance(ps2);
+		if (!render_distance_available || debug_state != debug_command_state::idle)
+			return;
+		if (action == distance_action::double_current)
+			distance = render_distance * 2.0f;
+		else if (action == distance_action::reset)
+		{
+			render_distance_default = read_default_render_distance(ps2, render_level_properties);
+			if (render_distance_default <= 0.0f)
+			{
+				render_distance_message = "The level default is unavailable. Try again once the level has loaded.";
+				return;
+			}
+			distance = render_distance_default;
+		}
+		std::array<distance_field, 10> fields;
+		if (!make_render_distance_values(distance, render_distance, render_fog_width, fields))
+		{
+			render_distance_message = "Enter a distance above 32 and at most 10000000.";
+			return;
+		}
+
+		const auto code = read_terrain_sector_code(ps2);
+		for (size_t i = 0; i < code.size(); ++i)
+		{
+			if (code[i] != terrain_sector_patch[i].original && code[i] != terrain_sector_patch[i].extended)
+			{
+				render_distance_message = "Terrain code is different from the supported version. No changes applied.";
+				return;
+			}
+		}
+		const bool extend_sectors = action != distance_action::reset;
+		ps2_ipc_cmd write(ps2);
+		for (const auto& instruction : terrain_sector_patch)
+			write.write<uint32_t>(instruction.address, extend_sectors ? instruction.extended : instruction.original);
+		for (const auto& field : fields)
+			write.write<float>(render_manager_address + field.offset, field.value);
+		write.write<uint32_t>(render_camera_address + 0xD4, 1); // Rebuild the camera planes.
+		write.send();
+		sentinel.increment();
+		update_render_distance(ps2);
+		render_distance_edit = distance;
+		render_distance_message = render_distance_available && render_distance == distance ?
+			nullptr : "The game changed the distance. Try again once the level has loaded.";
+		const auto applied_code = read_terrain_sector_code(ps2);
+		for (size_t i = 0; i < applied_code.size(); ++i)
+		{
+			const auto expected = extend_sectors ? terrain_sector_patch[i].extended : terrain_sector_patch[i].original;
+			if (applied_code[i] != expected)
+				render_distance_message = "Terrain visibility was not applied. Check for a conflicting cheat.";
+		}
+	}
+
+	void draw_render_distance_ui(const pcsx2& ps2)
+	{
+		ImGui::Separator();
+		ImGui::PushID("render_distance");
+		ImGui::Text("Draw distance and fog");
+		if (render_distance_available)
+			ImGui::Text("Current: %.3f", render_distance);
+		else
+			ImGui::TextUnformatted("Current: unavailable");
+		if (render_distance_default > 0.0f)
+			ImGui::Text("Level default: %.3f", render_distance_default);
+		ImGui::BeginDisabled(!render_distance_available || debug_state != debug_command_state::idle);
+		ImGui::SetNextItemWidth(160.0f);
+		ImGui::InputFloat("Distance", &render_distance_edit, 0.0f, 0.0f, "%.3f");
+		if (ImGui::Button("Apply"))
+			apply_render_distance(ps2, render_distance_edit);
+		ImGui::SameLine();
+		if (ImGui::Button("Double"))
+			apply_render_distance(ps2, 0.0f, distance_action::double_current);
+		ImGui::SameLine();
+		ImGui::BeginDisabled(render_distance_default <= 0.0f);
+		if (ImGui::Button("Reset"))
+			apply_render_distance(ps2, 0.0f, distance_action::reset);
+		ImGui::EndDisabled();
+		ImGui::EndDisabled();
+		if (render_distance_message != nullptr)
+			ImGui::TextUnformatted(render_distance_message);
+		ImGui::PopID();
+	}
+
 	void set_jump_height(const pcsx2& ps2, double multiplier)
 	{
 		// Height scales with launch velocity squared; gravity stays unchanged.
@@ -208,10 +507,7 @@ private:
 
 	bool update_player_position(const pcsx2& ps2)
 	{
-		ps2_ipc_cmd manager_read(ps2);
-		auto manager = manager_read.queue_read<uint32_t>(manager_global);
-		manager_read.send();
-		const auto manager_address = manager_read.read(manager);
+		const auto manager_address = read_ee_value<uint32_t>(ps2, manager_global);
 
 		if (manager_address == 0)
 		{
@@ -220,10 +516,7 @@ private:
 			return false;
 		}
 
-		ps2_ipc_cmd player_read(ps2);
-		auto player = player_read.queue_read<uint32_t>(manager_address + player_pointer_offset);
-		player_read.send();
-		const auto player_address = player_read.read(player);
+		const auto player_address = read_ee_value<uint32_t>(ps2, manager_address + player_pointer_offset);
 
 		if (player_address == 0)
 		{
@@ -240,10 +533,7 @@ private:
 
 	bool update_camera_position(const pcsx2& ps2)
 	{
-		ps2_ipc_cmd manager_read(ps2);
-		auto manager = manager_read.queue_read<uint32_t>(manager_global);
-		manager_read.send();
-		const auto manager_address = manager_read.read(manager);
+		const auto manager_address = read_ee_value<uint32_t>(ps2, manager_global);
 
 		if (manager_address == 0)
 		{
@@ -251,10 +541,7 @@ private:
 			return false;
 		}
 
-		ps2_ipc_cmd camera_read(ps2);
-		auto camera = camera_read.queue_read<uint32_t>(manager_address + camera_pointer_offset);
-		camera_read.send();
-		const auto camera_address = camera_read.read(camera);
+		const auto camera_address = read_ee_value<uint32_t>(ps2, manager_address + camera_pointer_offset);
 
 		if (camera_address == 0)
 		{
@@ -274,24 +561,15 @@ private:
 			return;
 
 		const auto camera_address = camera_position.get_address(position_x) - camera_position_offset;
-		ps2_ipc_cmd relation_read(ps2);
-		auto relation = relation_read.queue_read<uint32_t>(camera_address + actor_relation_offset);
-		relation_read.send();
-		const auto relation_address = relation_read.read(relation);
+		const auto relation_address = read_ee_value<uint32_t>(ps2, camera_address + actor_relation_offset);
 		if (relation_address == 0)
 			return;
 
-		ps2_ipc_cmd control_read(ps2);
-		auto control = control_read.queue_read<uint32_t>(relation_address + relation_control_offset);
-		control_read.send();
-		const auto control_address = control_read.read(control);
+		const auto control_address = read_ee_value<uint32_t>(ps2, relation_address + relation_control_offset);
 		if (control_address == 0)
 			return;
 
-		ps2_ipc_cmd mode_read(ps2);
-		auto mode = mode_read.queue_read<uint32_t>(control_address + controller_mode_offset);
-		mode_read.send();
-		fly_enabled = mode_read.read(mode) == fly_mode;
+		fly_enabled = read_ee_value<uint32_t>(ps2, control_address + controller_mode_offset) == fly_mode;
 	}
 
 	// Retail USA retained debug-command wrapper. It submits FLY, DROP or HUD once
@@ -388,10 +666,7 @@ private:
 		if (debug_state == debug_command_state::idle)
 			return;
 
-		ps2_ipc_cmd read_latch(ps2);
-		auto latch = read_latch.queue_read<uint32_t>(debug_completion_latch);
-		read_latch.send();
-		if (read_latch.read(latch) != 2)
+		if (read_ee_value<uint32_t>(ps2, debug_completion_latch) != 2)
 			return;
 
 		// The executor returned, so restore the hook before clearing the wrapper.
@@ -482,9 +757,9 @@ public:
 		coordinate("Z##rynn", player_position.get(position_z));
 
 		ImGui::Text("Set Rynn world position");
-		ImGui::InputFloat("Set X", &position_edit[position_x], 0.0f, 0.0f, "%.3f");
-		ImGui::InputFloat("Set Y", &position_edit[position_y], 0.0f, 0.0f, "%.3f");
-		ImGui::InputFloat("Set Z", &position_edit[position_z], 0.0f, 0.0f, "%.3f");
+		ImGui::InputFloat("X", &position_edit[position_x], 0.0f, 0.0f, "%.3f");
+		ImGui::InputFloat("Y", &position_edit[position_y], 0.0f, 0.0f, "%.3f");
+		ImGui::InputFloat("Z", &position_edit[position_z], 0.0f, 0.0f, "%.3f");
 
 		if (ImGui::Button("Apply Position"))
 		{
@@ -533,31 +808,40 @@ public:
 			ImGui::Text("Enable Debug Fly to use 'Drop Rynn at Camera'.");
 
 		ImGui::BeginDisabled(debug_state != debug_command_state::idle);
-		if (!fly_enabled)
-		{
-			if (ImGui::Button("Enable Debug Fly"))
-			{
-				start_debug_command(ps2, debug_command_state::waiting_for_fly);
-			}
-		}
-		else
-		{
-			if (ImGui::Button("Disable Debug Fly"))
-			{
-				start_debug_command(ps2, debug_command_state::waiting_for_fly);
-			}
-		}
+		if (ImGui::Button(fly_enabled ? "Disable Debug Fly" : "Enable Debug Fly"))
+			start_debug_command(ps2, debug_command_state::waiting_for_fly);
 		ImGui::EndDisabled();
-
-		ImGui::Separator();
 
 		draw_camera_speed_ui(ps2);
 		ImGui::Separator();
 
-		ImGui::Text("Miscellaneous");
-
 		if (debug_command_message != nullptr)
 			ImGui::TextUnformatted(debug_command_message);
+
+		if (!position_editor_initialized && player_position_available)
+		{
+			position_edit[position_x] = player_position.get(position_x);
+			position_edit[position_y] = player_position.get(position_y);
+			position_edit[position_z] = player_position.get(position_z);
+			position_editor_initialized = true;
+		}	
+
+		draw_render_distance_ui(ps2);
+
+		ImGui::Separator();
+		ImGui::Text("Miscellaneous");
+
+		if (ImGui::Button(collision_flag.is_on() ? "Enable Collision" : "Disable Collision"))
+		{
+			collision_flag.toggle();
+			sentinel.increment();
+		}
+
+		if (ImGui::Button(true_god_mode.is_on() ? "Disable True God mode" : "Enable True God mode"))
+		{
+			true_god_mode.toggle();
+			sentinel.increment();
+		}
 
 		ImGui::BeginDisabled(debug_state != debug_command_state::idle || !player_position_available);
 		if (ImGui::Button(hud_values.get(hud_visibility) != 0 ? "Hide HUD" : "Show HUD"))
@@ -566,25 +850,13 @@ public:
 		}
 		ImGui::EndDisabled();
 
-		if (!position_editor_initialized && player_position_available)
-		{
-			position_edit[position_x] = player_position.get(position_x);
-			position_edit[position_y] = player_position.get(position_y);
-			position_edit[position_z] = player_position.get(position_z);
-			position_editor_initialized = true;
-		}
-
-		if (ImGui::Button("Modify FOV")) 
+		ImGui::SetNextItemWidth(160.0f);
+		ImGui::SliderFloat("", &fov, 20.0f, 180.0f, "%.2f");
+		if (ImGui::Button("Modify FOV"))
 		{
 			fov_values.toggle_tweaking();
 			sentinel.increment();
-		} ImGui::SameLine();		
-
-
-		ImGui::SetNextItemWidth(160.0f);
-		ImGui::SliderFloat("", &fov, 20.0f, 180.0f, "%.2f");
-
-		ImGui::Separator();
+		} ImGui::SameLine();
 
 		ImGui::PushID("jump_height");
 		ImGui::SetNextItemWidth(160.0f);
@@ -605,63 +877,18 @@ public:
 			ImGui::TextUnformatted("Number invalid");
 		ImGui::PopID();
 
-		if (!collision_flag.is_on())
-		{
-			if (ImGui::Button("Disable Collision"))
-			{
-				collision_flag.set_on(true);
-				sentinel.increment();
-			}
-		}
-		else if (collision_flag.is_on())
-		{
-			if (ImGui::Button("Enable Collision"))
-			{
-				collision_flag.set_on(false);
-				sentinel.increment();
-			}
-		}
-
-		if (!true_god_mode.is_on()) {
-			if (ImGui::Button("Enable True God mode"))
-			{
-				true_god_mode.set_on(true);
-				sentinel.increment();
-			}
-		}
-		else if (true_god_mode.is_on())
-		{
-			if (ImGui::Button("Disable True God mode"))
-			{
-				true_god_mode.set_on(false);
-				sentinel.increment();
-			}
-		}
-
 		ImGui::Checkbox("Enable Experiments", &show_experimental_options);
 		if (show_experimental_options)
 		{
 			ImGui::Separator();
-	
 
-			if (!infinite_flag.is_on()) {
-				if (ImGui::Button("Enable infinite bow ammo/shoot speed"))
-				{
-					infinite_flag.set_on(true);
-					infinite_bow_shooting.toggle_tweaking();
-					infinite_bow_ammo.toggle_tweaking();
-					sentinel.increment();
-				}
-			}
-			else if (infinite_flag.is_on())
+			if (ImGui::Button(infinite_flag.is_on() ?
+				"Disable infinite bow ammo/shoot speed" : "Enable infinite bow ammo/shoot speed"))
 			{
-				if (ImGui::Button("Disable infinite bow ammo/shoot speed"))
-				{
-					infinite_flag.set_on(false);
-					infinite_bow_shooting.toggle_tweaking();
-					infinite_bow_ammo.toggle_tweaking();
-					sentinel.increment();
-				}
+				infinite_flag.toggle();
+				infinite_bow_shooting.toggle_tweaking();
+				infinite_bow_ammo.toggle_tweaking();
+				sentinel.increment();
 			}
 		}
 	}
@@ -674,6 +901,13 @@ public:
 		if (sentinel.has_reset())
 		{
 			position_editor_initialized = false;
+			render_distance_available = false;
+			render_distance_editor_initialized = false;
+			render_distance_default = 0.0f;
+			render_manager_address = 0;
+			render_camera_address = 0;
+			render_level_properties = 0;
+			render_distance_message = nullptr;
 			player_position_address = 0;
 			player_position_available = false;
 			camera_position_available = false;
@@ -694,6 +928,7 @@ public:
 		update_debug_command(ps2);
 		update_fly_mode(ps2);
 		update_camera_speed(ps2);
+		update_render_distance(ps2);
 		hud_values.update();
 
 		if (infinite_bow_shooting.currently_tweaking()) {
