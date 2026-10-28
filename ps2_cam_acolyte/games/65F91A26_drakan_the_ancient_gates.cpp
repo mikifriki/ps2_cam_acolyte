@@ -14,11 +14,15 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <chrono>
+#include <thread>
 #include <iostream>
 
 class drakan : public ps2_game
 {
 private:
+	// Linker padding after .reginfo, outside the game heap and EE code pages.
+	static constexpr uint32_t load_sentinel_address = 0x004DB270;
 	sentinel_counter sentinel;
 	restoring_toggle_state<5> collision_flag;
 	tweakable_value_set<float, 3> fov_values;
@@ -190,14 +194,12 @@ private:
 	}
 
 	bool render_distance_reset_pending = true;
-	bool render_distance_reset_failed = false;
 	float render_distance_reset_stable_time = 0.0f;
 	std::array<uint32_t, 6> render_distance_reset_snapshot = {};
 
 	void request_render_distance_reset()
 	{
 		render_distance_reset_pending = true;
-		render_distance_reset_failed = false;
 		render_distance_reset_stable_time = 0.0f;
 		render_distance_reset_snapshot = {};
 		render_distance_available = false;
@@ -421,6 +423,182 @@ private:
 		return true;
 	}
 
+	// This vtable callback runs before camera rebuild and terrain rendering. Keep the
+	// executor immutable: PINE writes only its mailbox, on a separate 4 KiB page.
+	static constexpr uint32_t render_callback = 0x00529A5C;
+	static constexpr uint32_t render_original_callback = 0x003B1DE0;
+	static constexpr uint32_t render_allocation = 0x00555C50;
+	static constexpr uint32_t render_bootstrap_address = 0x00555CAC;
+	static constexpr std::array<uint32_t, 18> render_bootstrap = {{
+		// Linker padding in .sbss; allocate once using the game's malloc(0x3000).
+		0x3C080055, 0x8D025C50, 0x14400009, 0x00000000,
+		0x27BDFFF0, 0x7FBF0000, 0x0C12AF80, 0x34043000,
+		0x3C080055, 0xAD025C50, 0x7BBF0000, 0x27BD0010,
+		// Restore the callback and tail-call it, preserving the caller's ra.
+		0x3C080053, 0x3C09003B, 0x35291DE0, 0xAD099A5C,
+		0x080EC778, 0x00000000,
+	}};
+
+	template<size_t N>
+	static std::array<uint32_t, N> read_render_program(const pcsx2& ps2, uint32_t address)
+	{
+		ps2_ipc_cmd read(ps2);
+		std::array<ps2_ipc_cmd::queued_read<uint32_t>, N> queued;
+		for (size_t i = 0; i < N; ++i)
+			queued[i] = read.queue_read<uint32_t>(address + static_cast<uint32_t>(i * 4));
+		read.send();
+		std::array<uint32_t, N> words;
+		for (size_t i = 0; i < N; ++i)
+			words[i] = read.read(queued[i]);
+		return words;
+	}
+
+	uint32_t prepare_render_mailbox(const pcsx2& ps2)
+	{
+		auto allocation = read_ee_value<uint32_t>(ps2, render_allocation);
+		auto callback = read_ee_value<uint32_t>(ps2, render_callback);
+		const bool allocate = allocation == 0;
+		if (allocate)
+		{
+			if (callback != render_original_callback && callback != render_bootstrap_address)
+				return 0;
+			const auto existing = read_render_program<render_bootstrap.size()>(ps2, render_bootstrap_address);
+			if (existing != render_bootstrap)
+			{
+				if (callback != render_original_callback || existing != decltype(existing){})
+					return 0;
+				ps2_ipc_cmd install(ps2);
+				for (size_t i = 0; i < render_bootstrap.size(); ++i)
+					install.write<uint32_t>(render_bootstrap_address + static_cast<uint32_t>(i * 4), render_bootstrap[i]);
+				install.send();
+				if (read_render_program<render_bootstrap.size()>(ps2, render_bootstrap_address) != render_bootstrap)
+					return 0;
+			}
+			ps2_ipc_cmd install_hook(ps2);
+			install_hook.write<uint32_t>(render_callback, render_bootstrap_address).send();
+			for (int wait = 0; wait < 100; ++wait)
+			{
+				allocation = read_ee_value<uint32_t>(ps2, render_allocation);
+				callback = read_ee_value<uint32_t>(ps2, render_callback);
+				if (callback == render_original_callback)
+					break;
+				std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			}
+			if (callback != render_original_callback)
+				return 0;
+		}
+		if (!valid_ee_address(allocation, 0x3000))
+			return 0;
+		if (sentinel.has_reset(false))
+			return 0;
+		const auto code = (allocation + 0xFFF) & ~0xFFFu;
+		const auto mailbox = code + 0x1000;
+		const std::array<uint32_t, 31> executor = {{
+			0x3C080000 | (mailbox >> 16), 0x35080000 | (mailbox & 0xFFFF),
+			0x8D090000, 0x19200015, 0x00000000, // Idle: tail-call the original callback.
+			0x2D220010, 0x10400014, 0x250A0020, 0x240B000A, // At most 15 writes, ten guards.
+			0x8D420000, 0x8D430004, 0x8C420000, 0x1443000E, 0x254A0008,
+			0x256BFFFF, 0x1560FFF9, 0x00000000, // Reject before writing if any guard differs.
+			0x250A0070, 0x8D420000, 0x8D430004, 0xAC430000,
+			0x2529FFFF, 0x1520FFFB, 0x254A0008, // Apply the complete batch on the EE thread.
+			0xAD000000, 0x080EC778, 0x00000000, // Acknowledge success.
+			0x2409FFFF, 0xAD090000, 0x080EC778, 0x00000000, // Acknowledge rejection.
+		}};
+		// A state may have been saved after malloc but before publishing the
+		// executor. Finish that installation only while it is still unreachable.
+		if (callback == render_original_callback)
+		{
+			if (read_render_program<render_bootstrap.size()>(ps2, render_bootstrap_address) != render_bootstrap)
+				return 0;
+			ps2_ipc_cmd install(ps2);
+			for (size_t i = 0; i < executor.size(); ++i)
+				install.write<uint32_t>(code + static_cast<uint32_t>(i * 4), executor[i]);
+			install.write<uint32_t>(mailbox, 0).send();
+		}
+		if (read_render_program<executor.size()>(ps2, code) != executor ||
+			(callback != render_original_callback && callback != code))
+			return 0;
+		if (callback != code)
+		{
+			ps2_ipc_cmd install_hook(ps2);
+			install_hook.write<uint32_t>(render_callback, code).send();
+		}
+		return mailbox;
+	}
+
+	bool queue_render_distance(const pcsx2& ps2, const std::array<distance_field, 10>& fields,
+		bool extend_sectors, const std::array<uint32_t, 4>& terrain_code)
+	{
+		const auto mailbox = prepare_render_mailbox(ps2);
+		if (sentinel.has_reset(false))
+		{
+			request_render_distance_reset();
+			return false;
+		}
+		if (mailbox == 0)
+		{
+			render_distance_message = "Draw distance hook is not ready.";
+			return false;
+		}
+		if (static_cast<int32_t>(read_ee_value<uint32_t>(ps2, mailbox)) > 0)
+		{
+			render_distance_message = "Waiting for the previous distance change.";
+			return false;
+		}
+		const std::array<std::array<uint32_t, 2>, 10> guards = {{
+			{ load_sentinel_address, read_ee_value<uint32_t>(ps2, load_sentinel_address) },
+			{ manager_global, render_manager_address }, { view_camera_global, render_camera_address },
+			{ render_manager_address + level_properties_offset, render_level_properties },
+			{ render_manager_address + 0x394, std::bit_cast<uint32_t>(render_distance) },
+			{ render_manager_address + 0x3A8, std::bit_cast<uint32_t>(render_fog_width) },
+			{ terrain_sector_patch[0].address, terrain_code[0] },
+			{ terrain_sector_patch[1].address, terrain_code[1] },
+			{ terrain_sector_patch[2].address, terrain_code[2] },
+			{ terrain_sector_patch[3].address, terrain_code[3] },
+		}};
+		ps2_ipc_cmd queue(ps2);
+		for (size_t i = 0; i < guards.size(); ++i)
+		{
+			queue.write<uint32_t>(mailbox + 0x20 + static_cast<uint32_t>(i * 8), guards[i][0]);
+			queue.write<uint32_t>(mailbox + 0x24 + static_cast<uint32_t>(i * 8), guards[i][1]);
+		}
+		uint32_t count = 0;
+		auto write = [&](uint32_t address, uint32_t value) {
+			queue.write<uint32_t>(mailbox + 0x70 + count * 8, address);
+			queue.write<uint32_t>(mailbox + 0x74 + count++ * 8, value);
+		};
+		for (size_t i = 0; i < terrain_sector_patch.size(); ++i)
+		{
+			const auto& instruction = terrain_sector_patch[i];
+			const auto desired = extend_sectors ? instruction.extended : instruction.original;
+			if (terrain_code[i] != desired)
+				write(instruction.address, desired);
+		}
+		for (const auto& field : fields)
+			write(render_manager_address + field.offset, std::bit_cast<uint32_t>(field.value));
+		write(render_camera_address + 0xD4, 1);
+		queue.send();
+		if (sentinel.has_reset(false))
+		{
+			request_render_distance_reset();
+			return false;
+		}
+		ps2_ipc_cmd publish(ps2);
+		publish.write<uint32_t>(mailbox, count).send(); // Publish only after the batch is complete.
+		for (int wait = 0; wait < 100; ++wait)
+		{
+			const auto remaining = read_ee_value<uint32_t>(ps2, mailbox);
+			if (remaining == 0)
+				return true;
+			if (remaining == 0xFFFFFFFF)
+				break;
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+		// Never reuse an unacknowledged batch. The next sentinel update expires it.
+		render_distance_message = "Distance change was not confirmed.";
+		return false;
+	}
+
 	enum class distance_action { apply, double_current, reset };
 
 	bool apply_render_distance(const pcsx2& ps2, float distance,
@@ -433,11 +611,7 @@ private:
 			return false;
 		}
 		if (render_distance_reset_pending && !recovering)
-		{
-			if (action == distance_action::reset && render_distance_reset_failed)
-				request_render_distance_reset();
 			return false;
-		}
 		update_render_distance(ps2);
 		if (!render_distance_available || debug_state != debug_command_state::idle)
 			return false;
@@ -476,24 +650,37 @@ private:
 		}
 		// A state load/level switch can occur between IPC batches. Recheck before writing.
 		update_render_distance(ps2);
-		if (sentinel.has_reset(false) || !render_distance_available ||
+		if (sentinel.has_reset(false))
+		{
+			request_render_distance_reset();
+			return false;
+		}
+		if (!render_distance_available ||
 			manager != render_manager_address || camera != render_camera_address ||
 			properties != render_level_properties || previous_distance != render_distance ||
 			previous_width != render_fog_width ||
 			(action == distance_action::reset &&
 			 distance != read_default_render_distance(ps2, render_level_properties)))
 		{
-			request_render_distance_reset();
+			// A changed snapshot cancels this action; it does not imply a state load.
+			// Recovery already in progress waits for a fresh stable snapshot.
+			render_distance_reset_stable_time = 0.0f;
+			render_distance_reset_snapshot = {};
+			render_distance_message = recovering ? nullptr :
+				"Game state changed while preparing the distance. No changes applied. Try again.";
 			return false;
 		}
 		const bool extend_sectors = action != distance_action::reset;
-		ps2_ipc_cmd write(ps2);
-		for (const auto& instruction : terrain_sector_patch)
-			write.write<uint32_t>(instruction.address, extend_sectors ? instruction.extended : instruction.original);
-		for (const auto& field : fields)
-			write.write<float>(render_manager_address + field.offset, field.value);
-		write.write<uint32_t>(render_camera_address + 0xD4, 1); // Rebuild the camera planes.
-		write.send();
+		// Guest stores at the pre-render callback keep recompiler invalidation on
+		// the EE thread and finish the mode switch before any terrain traversal.
+		if (ps2.get_ipc()->Status() != PINE::PCSX2::Running)
+		{
+			if (!recovering)
+				render_distance_message = "Resume the game to change draw distance.";
+			return false;
+		}
+		if (!queue_render_distance(ps2, fields, extend_sectors, code))
+			return false;
 		// Preserve a load notification if a state was restored during the write batch.
 		if (sentinel.has_reset(false))
 		{
@@ -525,7 +712,7 @@ private:
 
 	void update_render_distance_recovery(const pcsx2& ps2, float time_delta)
 	{
-		if (!render_distance_reset_pending || render_distance_reset_failed)
+		if (!render_distance_reset_pending)
 			return;
 		if (!render_distance_available || debug_state != debug_command_state::idle)
 		{
@@ -553,16 +740,18 @@ private:
 			render_distance_reset_stable_time += std::min(time_delta, 0.05f);
 		if (render_distance_reset_stable_time < 0.25f)
 			return;
+		render_distance_message = nullptr;
 		if (apply_render_distance(ps2, 0.0f, distance_action::reset, true))
 		{
 			render_distance_reset_pending = false;
 			render_distance_message = "Draw distance restored to the loaded level's default.";
 		}
-		else if (render_distance_message != nullptr)
+		else
 		{
-			// Stop on a real write/code error; a new load simply restarts the wait.
-			// Do not keep rewriting memory after an unsuccessful recovery.
-			render_distance_reset_failed = true;
+			// Loads, rejected guards and delayed callbacks can interrupt a reset.
+			// Wait for a fresh stable snapshot, then validate/reinstall and retry.
+			render_distance_reset_stable_time = 0.0f;
+			render_distance_reset_snapshot = {};
 		}
 	}
 
@@ -578,9 +767,7 @@ private:
 		if (render_distance_default > 0.0f)
 			ImGui::Text("Level default: %.3f", render_distance_default);
 		if (render_distance_reset_pending)
-			ImGui::TextUnformatted(render_distance_reset_failed ?
-				"Automatic reset stopped. Resolve the error below, then press Reset to retry." :
-				"Restoring the loaded level's default draw distance...");
+			ImGui::TextUnformatted("Restoring the loaded level's default draw distance...");
 		ImGui::BeginDisabled(!render_distance_available || debug_state != debug_command_state::idle);
 		ImGui::BeginDisabled(render_distance_reset_pending);
 		ImGui::SetNextItemWidth(160.0f);
@@ -1019,7 +1206,7 @@ private:
 
 public:
 	explicit drakan(const pcsx2& ps2)
-		: sentinel(ps2, 0x01000000)
+		: sentinel(ps2, load_sentinel_address)
 		, collision_flag(ps2, { {
 			{ 0x002354F8, 0x44801800, 0x460018C7 }, // Zero movement correction X.
 			{ 0x00235514, 0x44801000, 0x46001087 }, // Zero movement correction Z.
