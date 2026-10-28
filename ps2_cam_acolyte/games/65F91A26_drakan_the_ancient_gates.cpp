@@ -7,6 +7,7 @@
 #include "glm/vec3.hpp"
 #include "glm/geometric.hpp"
 #include "glm/matrix.hpp"
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <limits>
@@ -186,6 +187,26 @@ private:
 		if (camera_speed_message != nullptr)
 			ImGui::TextUnformatted(camera_speed_message);
 		ImGui::PopID();
+	}
+
+	bool render_distance_reset_pending = true;
+	bool render_distance_reset_failed = false;
+	float render_distance_reset_stable_time = 0.0f;
+	std::array<uint32_t, 6> render_distance_reset_snapshot = {};
+
+	void request_render_distance_reset()
+	{
+		render_distance_reset_pending = true;
+		render_distance_reset_failed = false;
+		render_distance_reset_stable_time = 0.0f;
+		render_distance_reset_snapshot = {};
+		render_distance_available = false;
+		render_distance_editor_initialized = false;
+		render_distance_default = 0.0f;
+		render_manager_address = 0;
+		render_camera_address = 0;
+		render_level_properties = 0;
+		render_distance_message = nullptr;
 	}
 
 	float render_distance = 0.0f;
@@ -402,11 +423,24 @@ private:
 
 	enum class distance_action { apply, double_current, reset };
 
-	void apply_render_distance(const pcsx2& ps2, float distance, distance_action action = distance_action::apply)
+	bool apply_render_distance(const pcsx2& ps2, float distance,
+		distance_action action = distance_action::apply, bool recovering = false)
 	{
+		// Observe without consuming the load notification needed by update().
+		if (sentinel.has_reset(false))
+		{
+			request_render_distance_reset();
+			return false;
+		}
+		if (render_distance_reset_pending && !recovering)
+		{
+			if (action == distance_action::reset && render_distance_reset_failed)
+				request_render_distance_reset();
+			return false;
+		}
 		update_render_distance(ps2);
 		if (!render_distance_available || debug_state != debug_command_state::idle)
-			return;
+			return false;
 		if (action == distance_action::double_current)
 			distance = render_distance * 2.0f;
 		else if (action == distance_action::reset)
@@ -415,7 +449,7 @@ private:
 			if (render_distance_default <= 0.0f)
 			{
 				render_distance_message = "The level default is unavailable. Try again once the level has loaded.";
-				return;
+				return false;
 			}
 			distance = render_distance_default;
 		}
@@ -423,17 +457,34 @@ private:
 		if (!make_render_distance_values(distance, render_distance, render_fog_width, fields))
 		{
 			render_distance_message = "Enter a distance above 32 and at most 10000000.";
-			return;
+			return false;
 		}
 
+		const auto manager = render_manager_address;
+		const auto camera = render_camera_address;
+		const auto properties = render_level_properties;
+		const auto previous_distance = render_distance;
+		const auto previous_width = render_fog_width;
 		const auto code = read_terrain_sector_code(ps2);
 		for (size_t i = 0; i < code.size(); ++i)
 		{
 			if (code[i] != terrain_sector_patch[i].original && code[i] != terrain_sector_patch[i].extended)
 			{
 				render_distance_message = "Terrain code is different from the supported version. No changes applied.";
-				return;
+				return false;
 			}
+		}
+		// A state load/level switch can occur between IPC batches. Recheck before writing.
+		update_render_distance(ps2);
+		if (sentinel.has_reset(false) || !render_distance_available ||
+			manager != render_manager_address || camera != render_camera_address ||
+			properties != render_level_properties || previous_distance != render_distance ||
+			previous_width != render_fog_width ||
+			(action == distance_action::reset &&
+			 distance != read_default_render_distance(ps2, render_level_properties)))
+		{
+			request_render_distance_reset();
+			return false;
 		}
 		const bool extend_sectors = action != distance_action::reset;
 		ps2_ipc_cmd write(ps2);
@@ -443,17 +494,75 @@ private:
 			write.write<float>(render_manager_address + field.offset, field.value);
 		write.write<uint32_t>(render_camera_address + 0xD4, 1); // Rebuild the camera planes.
 		write.send();
+		// Preserve a load notification if a state was restored during the write batch.
+		if (sentinel.has_reset(false))
+		{
+			request_render_distance_reset();
+			return false;
+		}
 		sentinel.increment();
 		update_render_distance(ps2);
 		render_distance_edit = distance;
 		render_distance_message = render_distance_available && render_distance == distance ?
 			nullptr : "The game changed the distance. Try again once the level has loaded.";
+		ps2_ipc_cmd verify(ps2);
+		std::array<ps2_ipc_cmd::queued_read<float>, 10> applied_fields;
+		for (size_t i = 0; i < fields.size(); ++i)
+			applied_fields[i] = verify.queue_read<float>(manager + fields[i].offset);
+		verify.send();
+		for (size_t i = 0; i < fields.size(); ++i)
+			if (verify.read(applied_fields[i]) != fields[i].value)
+				render_distance_message = "Distance or fog settings were not applied. Check for a conflicting cheat.";
 		const auto applied_code = read_terrain_sector_code(ps2);
 		for (size_t i = 0; i < applied_code.size(); ++i)
 		{
 			const auto expected = extend_sectors ? terrain_sector_patch[i].extended : terrain_sector_patch[i].original;
 			if (applied_code[i] != expected)
 				render_distance_message = "Terrain visibility was not applied. Check for a conflicting cheat.";
+		}
+		return render_distance_message == nullptr;
+	}
+
+	void update_render_distance_recovery(const pcsx2& ps2, float time_delta)
+	{
+		if (!render_distance_reset_pending || render_distance_reset_failed)
+			return;
+		if (!render_distance_available || debug_state != debug_command_state::idle)
+		{
+			render_distance_reset_stable_time = 0.0f;
+			render_distance_reset_snapshot = {};
+			return;
+		}
+		// Resolve the loaded level again, even if its property-holder address was reused.
+		render_distance_default = read_default_render_distance(ps2, render_level_properties);
+		if (render_distance_default <= 0.0f)
+		{
+			render_distance_reset_stable_time = 0.0f;
+			return;
+		}
+		const std::array<uint32_t, 6> snapshot = { render_manager_address, render_camera_address,
+			render_level_properties, std::bit_cast<uint32_t>(render_distance),
+			std::bit_cast<uint32_t>(render_fog_width), std::bit_cast<uint32_t>(render_distance_default) };
+		if (snapshot != render_distance_reset_snapshot)
+		{
+			render_distance_reset_snapshot = snapshot;
+			render_distance_reset_stable_time = 0.0f;
+			return;
+		}
+		if (std::isfinite(time_delta) && time_delta > 0.0f)
+			render_distance_reset_stable_time += std::min(time_delta, 0.05f);
+		if (render_distance_reset_stable_time < 0.25f)
+			return;
+		if (apply_render_distance(ps2, 0.0f, distance_action::reset, true))
+		{
+			render_distance_reset_pending = false;
+			render_distance_message = "Draw distance restored to the loaded level's default.";
+		}
+		else if (render_distance_message != nullptr)
+		{
+			// Stop on a real write/code error; a new load simply restarts the wait.
+			// Do not keep rewriting memory after an unsuccessful recovery.
+			render_distance_reset_failed = true;
 		}
 	}
 
@@ -468,7 +577,12 @@ private:
 			ImGui::TextUnformatted("Current: unavailable");
 		if (render_distance_default > 0.0f)
 			ImGui::Text("Level default: %.3f", render_distance_default);
+		if (render_distance_reset_pending)
+			ImGui::TextUnformatted(render_distance_reset_failed ?
+				"Automatic reset stopped. Resolve the error below, then press Reset to retry." :
+				"Restoring the loaded level's default draw distance...");
 		ImGui::BeginDisabled(!render_distance_available || debug_state != debug_command_state::idle);
+		ImGui::BeginDisabled(render_distance_reset_pending);
 		ImGui::SetNextItemWidth(160.0f);
 		ImGui::InputFloat("Distance", &render_distance_edit, 0.0f, 0.0f, "%.3f");
 		if (ImGui::Button("Apply"))
@@ -476,6 +590,7 @@ private:
 		ImGui::SameLine();
 		if (ImGui::Button("Double"))
 			apply_render_distance(ps2, 0.0f, distance_action::double_current);
+		ImGui::EndDisabled();
 		ImGui::SameLine();
 		ImGui::BeginDisabled(render_distance_default <= 0.0f);
 		if (ImGui::Button("Reset"))
@@ -948,19 +1063,10 @@ public:
 
 	void update(const pcsx2& ps2, const controller_state& c, playback& camera_playback, float time_delta) override
 	{
-		update_player_position(ps2);
-		update_camera_position(ps2);
-
 		if (sentinel.has_reset())
 		{
 			position_editor_initialized = false;
-			render_distance_available = false;
-			render_distance_editor_initialized = false;
-			render_distance_default = 0.0f;
-			render_manager_address = 0;
-			render_camera_address = 0;
-			render_level_properties = 0;
-			render_distance_message = nullptr;
+			request_render_distance_reset();
 			player_position_address = 0;
 			player_position_available = false;
 			camera_position_available = false;
@@ -978,10 +1084,13 @@ public:
 
 		}
 
+		update_player_position(ps2);
+		update_camera_position(ps2);
 		update_debug_command(ps2);
 		update_fly_mode(ps2);
 		update_camera_speed(ps2);
 		update_render_distance(ps2);
+		update_render_distance_recovery(ps2, time_delta);
 		hud_values.update();
 
 		if (infinite_bow_shooting.currently_tweaking()) {
@@ -997,6 +1106,8 @@ public:
 			fov_values.set(camera_fov_neg, -fov);
 			fov_values.flush(ps2);
 		}
+		// Refresh every poll so loading a state is detected even with no recent UI changes.
+		sentinel.increment();
 	}
 
 	bool needs_ui_refresh() const override
