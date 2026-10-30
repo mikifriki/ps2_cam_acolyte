@@ -3,6 +3,7 @@
 #include "../ps2_commands.h"
 #include "shared_camera.h"
 #include "shared_ui.h"
+#include "drakan_arokh_programs.h"
 #include "glm/trigonometric.hpp"
 #include "glm/vec3.hpp"
 #include "glm/geometric.hpp"
@@ -886,17 +887,168 @@ private:
 		0xAD090180, 0x8FA20004, 0x7BBF0020, 0x03E00008, 0x27BD0030,
 	} };
 
+	// Native dragon teleport/enable wrapper; shares the debug command busy state.
+	// Resolves companion handles in-game and preserves all 60 transform bytes.
+	static constexpr uint32_t arokh_code_cave = 0x01FF0200;
+	static constexpr uint32_t arokh_temporary_hook = 0x0C7FC080;
+	static constexpr uint32_t arokh_workspace_size = 0x600;
+	static constexpr uint32_t arokh_completion_latch = 0x01FF0780;
+	static constexpr uint32_t arokh_enable_event = 0x01FF0790;
+	static constexpr uint32_t arokh_enable_payload = 0x01FF07A0;
+
 	enum class debug_command_state
 	{
 		idle,
 		waiting_for_fly,
 		waiting_for_drop,
 		waiting_for_hud,
+		waiting_for_arokh,
+		waiting_for_arokh_spawn,
 	};
 
 	debug_command_state debug_state = debug_command_state::idle;
 	bool fly_enabled = false;
+	bool arokh_missing = false;
+	const char* arokh_message = nullptr;
 	const char* debug_command_message = nullptr;
+
+	enum class arokh_action { teleport, spawn };
+	enum class arokh_result : uint32_t
+	{
+		ready = 0,
+		running = 1,
+		complete = 2,
+		unavailable = 3,
+		missing = 4,
+		already_exists = 5,
+	};
+
+	bool arokh_workspace_available(const pcsx2& ps2)
+	{
+		ps2_ipc_cmd hook_read(ps2);
+		auto hook = hook_read.queue_read<uint32_t>(debug_update_hook);
+		auto delay_slot = hook_read.queue_read<uint32_t>(debug_update_hook + 4);
+		hook_read.send();
+		if (hook_read.read(hook) != debug_expected_hook || hook_read.read(delay_slot) != 0)
+		{
+			arokh_message = "Arokh command unavailable: update hook is in use.";
+			return false;
+		}
+
+		// Keep batches below the IPC helper's 8-bit command index limit.
+		for (uint32_t offset = 0; offset < arokh_workspace_size; offset += 0x200)
+		{
+			ps2_ipc_cmd workspace_read(ps2);
+			std::array<ps2_ipc_cmd::queued_read<uint32_t>, 128> workspace;
+			for (size_t i = 0; i < workspace.size(); ++i)
+			{
+				workspace[i] = workspace_read.queue_read<uint32_t>(arokh_code_cave + offset +
+					static_cast<uint32_t>(i * sizeof(uint32_t)));
+			}
+			workspace_read.send();
+			for (const auto& word : workspace)
+			{
+				if (workspace_read.read(word) != 0)
+				{
+					arokh_message = "Arokh command unavailable: command workspace is in use.";
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	void upload_arokh_program(const pcsx2& ps2, arokh_action action)
+	{
+		const auto* wrapper = action == arokh_action::spawn ?
+			drakan_arokh_programs::spawn.data() : drakan_arokh_programs::teleport.data();
+		const auto wrapper_size = action == arokh_action::spawn ?
+			drakan_arokh_programs::spawn.size() : drakan_arokh_programs::teleport.size();
+		for (size_t offset = 0; offset < wrapper_size; offset += 128)
+		{
+			ps2_ipc_cmd install_code(ps2);
+			for (size_t i = offset; i < wrapper_size && i < offset + 128; ++i)
+			{
+				install_code.write<uint32_t>(arokh_code_cave + static_cast<uint32_t>(i * sizeof(uint32_t)), wrapper[i]);
+			}
+			install_code.send();
+		}
+	}
+
+	bool start_arokh_command(const pcsx2& ps2, arokh_action action)
+	{
+		if (debug_state != debug_command_state::idle || !player_position_available ||
+			(action == arokh_action::spawn && !arokh_missing))
+			return false;
+
+		// Validate first; never overwrite another command's hook or workspace.
+		if (!arokh_workspace_available(ps2))
+			return false;
+
+		upload_arokh_program(ps2, action);
+		// Publish the request only after its program and input data are ready.
+		ps2_ipc_cmd install(ps2);
+		install.write<uint32_t>(arokh_enable_event, 0);
+		install.write<uint32_t>(arokh_enable_event + 4, arokh_enable_payload);
+		install.write<uint32_t>(arokh_enable_payload, 0x1001);
+		install.write<uint32_t>(arokh_completion_latch, 0);
+		install.write<uint32_t>(debug_update_hook, arokh_temporary_hook); // Install the hook last.
+		install.send();
+		debug_state = action == arokh_action::spawn ? debug_command_state::waiting_for_arokh_spawn : debug_command_state::waiting_for_arokh;
+		arokh_missing = false;
+		arokh_message = nullptr;
+		debug_command_message = nullptr;
+		return true;
+	}
+
+	void update_arokh_command(const pcsx2& ps2)
+	{
+		ps2_ipc_cmd completion_read(ps2);
+		auto hook = completion_read.queue_read<uint32_t>(debug_update_hook);
+		auto latch = completion_read.queue_read<uint32_t>(arokh_completion_latch);
+		completion_read.send();
+		const auto hook_value = completion_read.read(hook);
+		const auto result = static_cast<arokh_result>(completion_read.read(latch));
+		if (hook_value != arokh_temporary_hook)
+		{
+			arokh_missing = false;
+			arokh_message = debug_state == debug_command_state::waiting_for_arokh_spawn ?
+				"Arokh spawn interrupted." : "Arokh teleport interrupted.";
+			debug_state = debug_command_state::idle;
+			return;
+		}
+		// Wait while the PS2 is still executing the request.
+		if (result < arokh_result::complete || result > arokh_result::already_exists)
+			return;
+
+		// Stop entering the program before clearing its temporary memory.
+		ps2_ipc_cmd restore_hook(ps2);
+		restore_hook.write<uint32_t>(debug_update_hook, debug_expected_hook).send();
+
+		for (uint32_t offset = 0; offset < arokh_workspace_size; offset += 0x200)
+		{
+			ps2_ipc_cmd clear_workspace(ps2);
+			for (uint32_t word = 0; word < 0x200; word += sizeof(uint32_t))
+			{
+				clear_workspace.write<uint32_t>(arokh_code_cave + offset + word, 0);
+			}
+			clear_workspace.send();
+		}
+		const bool spawning = debug_state == debug_command_state::waiting_for_arokh_spawn;
+		debug_state = debug_command_state::idle;
+		arokh_missing = !spawning && result == arokh_result::missing;
+		if (arokh_missing)
+			arokh_message = "Arokh is missing. Use Spawn Arokh to bring him here.";
+		else if (result == arokh_result::already_exists)
+			arokh_message = "Arokh already exists. Use Teleport Arokh to Rynn.";
+		else if (spawning)
+			arokh_message = result == arokh_result::complete ? "Arokh spawned next to Rynn." :
+				"Arokh spawn did not complete. Try teleport again once the level has loaded.";
+		else
+			arokh_message = result == arokh_result::complete ? "Arokh moved next to Rynn." :
+				"Unable to summon Arokh. Dismount and make sure he is available.";
+	}
 
 	bool start_debug_command(const pcsx2& ps2, debug_command_state command)
 	{
@@ -957,6 +1109,13 @@ private:
 
 	void update_debug_command(const pcsx2& ps2)
 	{
+		if (debug_state == debug_command_state::waiting_for_arokh ||
+			debug_state == debug_command_state::waiting_for_arokh_spawn)
+		{
+			update_arokh_command(ps2);
+			return;
+		}
+
 		if (debug_state == debug_command_state::idle)
 			return;
 
@@ -1129,6 +1288,24 @@ private:
 		draw_render_distance_ui(ps2);
 	}
 
+	void draw_arokh_settings_ui(const pcsx2& ps2)
+	{
+		if (!ImGui::CollapsingHeader("Arokh!", ImGuiTreeNodeFlags_DefaultOpen))
+			return;
+
+		ImGui::BeginDisabled(debug_state != debug_command_state::idle || !player_position_available);
+		if (ImGui::Button("Teleport Arokh to Rynn"))
+			start_arokh_command(ps2, arokh_action::teleport);
+		// A missing companion is the only result that permits creation.
+		ImGui::BeginDisabled(!arokh_missing);
+		if (ImGui::Button("Spawn Arokh"))
+			start_arokh_command(ps2, arokh_action::spawn);
+		ImGui::EndDisabled();
+		ImGui::EndDisabled();
+		if (arokh_message != nullptr)
+			ImGui::TextUnformatted(arokh_message);
+	}
+
 	void draw_jump_height_ui(const pcsx2& ps2)
 	{
 		ImGui::PushID("jump_height");
@@ -1237,6 +1414,7 @@ public:
 		draw_rynn_position_ui(ps2);
 		draw_camera_ui(ps2);
 		draw_view_settings_ui(ps2);
+		draw_arokh_settings_ui(ps2);
 		draw_gameplay_ui(ps2);
 	}
 
@@ -1257,7 +1435,12 @@ public:
 			set_camera_speed(ps2, 1.0f);
 			infinite_bow_shooting.reset();
 			infinite_bow_ammo.reset();
-			debug_state = debug_command_state::idle;
+			arokh_missing = false;
+			arokh_message = nullptr;
+			// An in-flight Arokh command still needs its normal ownership check/cleanup.
+			if (debug_state != debug_command_state::waiting_for_arokh &&
+				debug_state != debug_command_state::waiting_for_arokh_spawn)
+				debug_state = debug_command_state::idle;
 			fly_enabled = false;
 			debug_command_message = nullptr;
 
