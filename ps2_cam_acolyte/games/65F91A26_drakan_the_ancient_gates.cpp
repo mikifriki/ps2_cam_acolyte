@@ -26,6 +26,8 @@ private:
 	static constexpr uint32_t load_sentinel_address = 0x004DB270;
 	sentinel_counter sentinel;
 	restoring_toggle_state<5> collision_flag;
+	restoring_toggle_state<3> arokh_collision_flag;
+	bool collision_before_arokh = false;
 	tweakable_value_set<float, 3> fov_values;
 	read_only_value_set<float, 3> player_position;
 	uint32_t player_position_address = 0;
@@ -1304,6 +1306,20 @@ private:
 		ImGui::EndDisabled();
 		if (arokh_message != nullptr)
 			ImGui::TextUnformatted(arokh_message);
+
+		ImGui::Separator();
+		ImGui::Text("Arokh collision: %s", arokh_collision_flag.is_on() ? "Off" : "On");
+		if (ImGui::Button(arokh_collision_flag.is_on() ? "Enable Arokh Collision" : "Disable Arokh Collision"))
+		{
+			if (!arokh_collision_flag.is_on())
+				collision_before_arokh = collision_flag.is_on();
+			arokh_collision_flag.toggle();
+			// Arokh also needs the existing shared movement bypass.
+			collision_flag.set_on(arokh_collision_flag.is_on() || collision_before_arokh);
+			sentinel.increment();
+		}
+		if (arokh_collision_flag.is_on())
+			ImGui::TextUnformatted("Also disables Rynn collision while enabled.");
 	}
 
 	void draw_jump_height_ui(const pcsx2& ps2)
@@ -1356,11 +1372,13 @@ private:
 
 		ImGui::Text("Collision: %s", collision_flag.is_on() ? "Off" : "On");
 		ImGui::SameLine();
+		ImGui::BeginDisabled(arokh_collision_flag.is_on());
 		if (ImGui::Button(collision_flag.is_on() ? "Enable Collision" : "Disable Collision"))
 		{
 			collision_flag.toggle();
 			sentinel.increment();
 		}
+		ImGui::EndDisabled();
 
 		ImGui::Text("God mode: %s", true_god_mode.is_on() ? "On" : "Off");
 		ImGui::SameLine();
@@ -1382,6 +1400,11 @@ public:
 			{ 0x0023551C, 0x44800800, 0x46000847 }, // Zero movement correction Y.
 			{ 0x00235558, 0x10000005, 0x0C08D5B4 }, // Skip both collision solver passes.
 			{ 0x00281778, 0x10000093, 0x14400093 }  // Bypass Arokh environment response.
+		} })
+		, arokh_collision_flag(ps2, { {
+			{ 0x002744FC, 0xE6350904, 0xE6200904 }, // Keep the flight speed multiplier at 1.
+			{ 0x00280BE8, 0x03E00008, 0x27BDFE00 }, // Return before Arokh contact/impact response.
+			{ 0x00280BEC, 0x00000000, 0x3C03004F }  // Return delay slot.
 		} })
 		, fov_values(ps2, { 
 			 { 0x006C65E0, 0x06C668C, 0x006C6674 },
@@ -1427,7 +1450,9 @@ public:
 			player_position_address = 0;
 			player_position_available = false;
 			camera_position_available = false;
+			arokh_collision_flag.reset();
 			collision_flag.reset();
+			collision_before_arokh = false;
 			fov_values.reset();
 			infinite_flag.reset();
 			true_god_mode.reset();
