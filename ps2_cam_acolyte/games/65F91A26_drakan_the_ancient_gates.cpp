@@ -457,8 +457,7 @@ private:
 	{
 		auto allocation = read_ee_value<uint32_t>(ps2, render_allocation);
 		auto callback = read_ee_value<uint32_t>(ps2, render_callback);
-		const bool allocate = allocation == 0;
-		if (allocate)
+		if (allocation == 0)
 		{
 			if (callback != render_original_callback && callback != render_bootstrap_address)
 				return 0;
@@ -537,12 +536,12 @@ private:
 		}
 		if (mailbox == 0)
 		{
-			render_distance_message = "Draw distance hook is not ready.";
+			render_distance_message = "Draw distance is unavailable.";
 			return false;
 		}
 		if (static_cast<int32_t>(read_ee_value<uint32_t>(ps2, mailbox)) > 0)
 		{
-			render_distance_message = "Waiting for the previous distance change.";
+			render_distance_message = "Updating draw distance...";
 			return false;
 		}
 		const std::array<std::array<uint32_t, 2>, 10> guards = {{
@@ -595,7 +594,7 @@ private:
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
 		// Never reuse an unacknowledged batch. The next sentinel update expires it.
-		render_distance_message = "Distance change was not confirmed.";
+		render_distance_message = "Could not change draw distance. Try again.";
 		return false;
 	}
 
@@ -622,7 +621,7 @@ private:
 			render_distance_default = read_default_render_distance(ps2, render_level_properties);
 			if (render_distance_default <= 0.0f)
 			{
-				render_distance_message = "The level default is unavailable. Try again once the level has loaded.";
+				render_distance_message = "Level default is unavailable.";
 				return false;
 			}
 			distance = render_distance_default;
@@ -644,7 +643,7 @@ private:
 		{
 			if (code[i] != terrain_sector_patch[i].original && code[i] != terrain_sector_patch[i].extended)
 			{
-				render_distance_message = "Terrain code is different from the supported version. No changes applied.";
+				render_distance_message = "Draw distance is unavailable for this game state.";
 				return false;
 			}
 		}
@@ -662,12 +661,9 @@ private:
 			(action == distance_action::reset &&
 			 distance != read_default_render_distance(ps2, render_level_properties)))
 		{
-			// A changed snapshot cancels this action; it does not imply a state load.
-			// Recovery already in progress waits for a fresh stable snapshot.
-			render_distance_reset_stable_time = 0.0f;
-			render_distance_reset_snapshot = {};
+			// Cancel this action; the recovery caller handles waiting and retrying.
 			render_distance_message = recovering ? nullptr :
-				"Game state changed while preparing the distance. No changes applied. Try again.";
+				"Could not change draw distance. Try again.";
 			return false;
 		}
 		const bool extend_sectors = action != distance_action::reset;
@@ -691,7 +687,7 @@ private:
 		update_render_distance(ps2);
 		render_distance_edit = distance;
 		render_distance_message = render_distance_available && render_distance == distance ?
-			nullptr : "The game changed the distance. Try again once the level has loaded.";
+			nullptr : "Could not change draw distance. Try again.";
 		ps2_ipc_cmd verify(ps2);
 		std::array<ps2_ipc_cmd::queued_read<float>, 10> applied_fields;
 		for (size_t i = 0; i < fields.size(); ++i)
@@ -699,13 +695,13 @@ private:
 		verify.send();
 		for (size_t i = 0; i < fields.size(); ++i)
 			if (verify.read(applied_fields[i]) != fields[i].value)
-				render_distance_message = "Distance or fog settings were not applied. Check for a conflicting cheat.";
+				render_distance_message = "Could not change draw distance. Try again.";
 		const auto applied_code = read_terrain_sector_code(ps2);
 		for (size_t i = 0; i < applied_code.size(); ++i)
 		{
 			const auto expected = extend_sectors ? terrain_sector_patch[i].extended : terrain_sector_patch[i].original;
 			if (applied_code[i] != expected)
-				render_distance_message = "Terrain visibility was not applied. Check for a conflicting cheat.";
+				render_distance_message = "Could not change draw distance. Try again.";
 		}
 		return render_distance_message == nullptr;
 	}
@@ -742,10 +738,7 @@ private:
 			return;
 		render_distance_message = nullptr;
 		if (apply_render_distance(ps2, 0.0f, distance_action::reset, true))
-		{
 			render_distance_reset_pending = false;
-			render_distance_message = "Draw distance restored to the loaded level's default.";
-		}
 		else
 		{
 			// Loads, rejected guards and delayed callbacks can interrupt a reset.
@@ -767,9 +760,9 @@ private:
 		if (render_distance_default > 0.0f)
 			ImGui::Text("Level default: %.3f", render_distance_default);
 		if (render_distance_reset_pending)
-			ImGui::TextUnformatted("Restoring the loaded level's default draw distance...");
-		ImGui::BeginDisabled(!render_distance_available || debug_state != debug_command_state::idle);
-		ImGui::BeginDisabled(render_distance_reset_pending);
+			ImGui::TextUnformatted("Resetting draw distance...");
+		ImGui::BeginDisabled(!render_distance_available || render_distance_reset_pending ||
+			debug_state != debug_command_state::idle);
 		ImGui::SetNextItemWidth(160.0f);
 		ImGui::InputFloat("Distance", &render_distance_edit, 0.0f, 0.0f, "%.3f");
 		if (ImGui::Button("Apply"))
@@ -777,7 +770,6 @@ private:
 		ImGui::SameLine();
 		if (ImGui::Button("Double"))
 			apply_render_distance(ps2, 0.0f, distance_action::double_current);
-		ImGui::EndDisabled();
 		ImGui::SameLine();
 		ImGui::BeginDisabled(render_distance_default <= 0.0f);
 		if (ImGui::Button("Reset"))
