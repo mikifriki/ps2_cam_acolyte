@@ -3,7 +3,6 @@
 #include <cstdint>
 
 // Full EE context preservation; idle-only, identity-checked power removal.
-// Assembly: acolyte-arokh-remove-ui-2026-10-31/remove.s.
 struct drakan_arokh_remove_program
 {
 static constexpr std::array<uint32_t, 305> remove_power = {{

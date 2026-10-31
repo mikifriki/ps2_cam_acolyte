@@ -3,7 +3,6 @@
 #include <cstdint>
 
 // Preserve EE context; submit a standard GIVE or native projectile grant and selection.
-// Human-readable assembly: acolyte-arokh-mounted-powers-2026-10-30/power.s.
 struct drakan_arokh_power_program
 {
 static constexpr std::array<uint32_t, 248> give_power = {{

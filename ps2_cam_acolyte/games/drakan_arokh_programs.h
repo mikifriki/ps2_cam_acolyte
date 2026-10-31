@@ -6,7 +6,6 @@
 // Precompiled PS2 code for Drakan USA SCUS-97128 / 4167D813.
 // These words execute inside the game, where native actor operations must run.
 // Application flow and safety checks are in start_arokh_command/update_arokh_command.
-// The arrays are unchanged from the tested October 18 implementation.
 struct drakan_arokh_programs
 {
 	// Find Rynn's companion; reject invalid/dead/mounted cases.
