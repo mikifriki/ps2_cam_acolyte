@@ -62,17 +62,18 @@ sentinel_counter::sentinel_counter(const pcsx2& ps2, size_t address)
 	, read(ps2)
 {
 	last_value = 1; // force a reset on first update
-	read.queue_read<uint32_t>(address);
+	read_value = read.queue_read<uint32_t>(address);
 	read.finalize();
 }
 
-bool sentinel_counter::has_reset()
+bool sentinel_counter::has_reset(bool acknowledge)
 {
 	read.send();
 	uint32_t new_value = read.read(read_value);
 	if (new_value != last_value)
 	{
-		last_value = new_value;
+		if (acknowledge)
+			last_value = new_value;
 		return true;
 	}
 	else

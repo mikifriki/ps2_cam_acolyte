@@ -7,4 +7,4 @@ struct version
 	int patch = 0;
 };
 
-static constexpr version current_version = { 0, 8, 5 };
+static constexpr version current_version = { 0, 8, 7 };

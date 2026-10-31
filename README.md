@@ -8,6 +8,7 @@ Support is currently focused on PS2 horror games(in particular early prototypes)
 
 | UUID     | Game                                   | Notes                                                        |
 | -------- | -------------------------------------- | ------------------------------------------------------------ |
+| 4167D813 | Drakan - The Ancients' Gates (USA)     |                                                              |
 | 901AAC09 | Haunting Ground (USA)                  |                                                              |
 | F7557FA5 | Kuon (Aug 2nd Prototype)               | https://hiddenpalace.org/Kuon_(Aug_2,_2004_prototype)        |
 | 9AC63A2E | Kuon (USA)                             |                                                              |

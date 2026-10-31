@@ -108,11 +108,11 @@ private:
 	size_t address = 0;
 	uint32_t last_value = 0;
 	ps2_ipc_cmd read;
-	ps2_ipc_cmd::queued_read<size_t> read_value;
+	ps2_ipc_cmd::queued_read<uint32_t> read_value;
 
 public:
 	sentinel_counter(const pcsx2& ps2, size_t address);
-	bool has_reset();
+	bool has_reset(bool acknowledge = true);
 	void increment();
 };
 
