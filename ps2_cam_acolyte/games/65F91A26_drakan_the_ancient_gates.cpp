@@ -5,6 +5,7 @@
 #include "shared_ui.h"
 #include "drakan_arokh_programs.h"
 #include "drakan_arokh_power_program.h"
+#include "drakan_arokh_remove_program.h"
 #include <cstring>
 #include "glm/trigonometric.hpp"
 #include "glm/vec3.hpp"
@@ -447,14 +448,18 @@ private:
 	template<size_t N>
 	static std::array<uint32_t, N> read_render_program(const pcsx2& ps2, uint32_t address)
 	{
-		ps2_ipc_cmd read(ps2);
-		std::array<ps2_ipc_cmd::queued_read<uint32_t>, N> queued;
-		for (size_t i = 0; i < N; ++i)
-			queued[i] = read.queue_read<uint32_t>(address + static_cast<uint32_t>(i * 4));
-		read.send();
 		std::array<uint32_t, N> words;
-		for (size_t i = 0; i < N; ++i)
-			words[i] = read.read(queued[i]);
+		for (size_t first = 0; first < N; first += 128)
+		{
+			ps2_ipc_cmd read(ps2);
+			std::array<ps2_ipc_cmd::queued_read<uint32_t>, 128> queued;
+			const auto count = std::min(size_t(128), N - first);
+			for (size_t i = 0; i < count; ++i)
+				queued[i] = read.queue_read<uint32_t>(address + static_cast<uint32_t>((first + i) * 4));
+			read.send();
+			for (size_t i = 0; i < count; ++i)
+				words[first + i] = read.read(queued[i]);
+		}
 		return words;
 	}
 
@@ -871,7 +876,7 @@ private:
 		fly_enabled = read_ee_value<uint32_t>(ps2, control_address + controller_mode_offset) == fly_mode;
 	}
 
-	// Retail USA retained debug-command wrapper. It submits FLY, DROP or HUD once
+	// Retail USA retained debug-command wrapper. It submits FLY, DROP, HUD or HENDRIX once
 	// and restores the update hook after the game has returned from it.
 	static constexpr uint32_t debug_update_hook = 0x00135DC8;
 	static constexpr uint32_t debug_expected_hook = 0x0C075748;
@@ -882,6 +887,8 @@ private:
 	static constexpr uint32_t fly_command = 0x00796C66; // "fly\\0"
 	static constexpr uint32_t drop_command = 0x706F7264; // "drop", followed by a zero word.
 	static constexpr uint32_t hud_command = 0x00647568; // "hud\\0"
+	static constexpr uint32_t hendrix_command = 0x646E6568; // "hend"
+	static constexpr uint32_t hendrix_command_tail = 0x00786972; // "rix" and terminator.
 	static constexpr std::array<uint32_t, 30> debug_wrapper = { {
 		0x27BDFFD0, 0x7FBF0020, 0xAFA40000, 0x0C075748, 0x00000000,
 		0xAFA20004, 0x3C0801FF, 0x8D090180, 0x15200011, 0x00000000,
@@ -906,6 +913,7 @@ private:
 		waiting_for_fly,
 		waiting_for_drop,
 		waiting_for_hud,
+		waiting_for_hendrix,
 		waiting_for_arokh,
 		waiting_for_arokh_spawn,
 		waiting_for_arokh_power,
@@ -917,7 +925,7 @@ private:
 	const char* arokh_message = nullptr;
 	const char* debug_command_message = nullptr;
 
-	enum class arokh_action { teleport, spawn, give_power };
+	enum class arokh_action { teleport, spawn, give_power, remove_power };
 	enum class arokh_result : uint32_t
 	{
 		ready = 0,
@@ -966,10 +974,13 @@ private:
 		uint32_t controller = 0;
 		uint32_t records = 0;
 		uint32_t count = 0;
+		uint32_t capacity = 0;
 		int32_t selected = -1;
 		std::array<arokh_power_record, 64> powers = {};
 	};
 	arokh_power_snapshot arokh_powers;
+	arokh_power_snapshot arokh_remove_before;
+	int arokh_remove_index = -1;
 	bool arokh_powers_available = false;
 	float arokh_power_refresh_time = 0.0f;
 	int arokh_power_selection = 0;
@@ -1055,6 +1066,7 @@ private:
 		next.selected = static_cast<int32_t>(header[0]);
 		next.records = header[1];
 		next.count = header[3];
+		next.capacity = header[2];
 		if (next.count > next.powers.size() || header[2] < next.count || header[2] > 65536 ||
 			next.selected < -1 || (next.selected >= 0 && static_cast<uint32_t>(next.selected) >= next.count) ||
 			(next.count != 0 && !valid_ee_address(next.records, next.count * 16)))
@@ -1245,6 +1257,11 @@ private:
 
 	void finish_arokh_power(const pcsx2& ps2, bool completed)
 	{
+		if (arokh_remove_index >= 0)
+		{
+			finish_arokh_remove(ps2, completed);
+			return;
+		}
 		refresh_arokh_powers(ps2);
 		const auto& option = arokh_power_options[arokh_power_requested];
 		bool granted = completed && arokh_powers_available && arokh_has_power(option.primary_key);
@@ -1262,6 +1279,113 @@ private:
 		std::snprintf(arokh_power_message, sizeof(arokh_power_message), granted ?
 			"Arokh has %s." : "Could not confirm %s. Check Arokh's powers and try again.", option.name);
 		arokh_power_requested = -1;
+	}
+
+	static bool same_arokh_power(const arokh_power_record& a, const arokh_power_record& b)
+	{
+		return a.primary == b.primary && a.secondary == b.secondary && a.hud == b.hud &&
+			a.flags == b.flags && a.primary_key == b.primary_key;
+	}
+
+	bool arokh_attack_idle(const pcsx2& ps2, uint32_t control) const
+	{
+		return (read_ee_value<uint32_t>(ps2, control + 0x90) & 0x22) == 0 &&
+			read_ee_value<uint32_t>(ps2, control + 0x89C) == 0 &&
+			read_ee_value<uint32_t>(ps2, control + 0x9C) == 0;
+	}
+
+	bool start_arokh_remove(const pcsx2& ps2, uint32_t index)
+	{
+		if (debug_state != debug_command_state::idle || !arokh_powers_available ||
+			index >= arokh_powers.count)
+			return false;
+		const auto clicked = arokh_powers;
+		refresh_arokh_powers(ps2);
+		if (!arokh_powers_available || ps2.get_ipc()->Status() != PINE::PCSX2::Running ||
+			arokh_powers.controller != clicked.controller || arokh_powers.manager != clicked.manager ||
+			index >= arokh_powers.count || !same_arokh_power(clicked.powers[index], arokh_powers.powers[index]))
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Powers changed. Select Remove again during gameplay.");
+			return false;
+		}
+		if (arokh_powers.count <= 1)
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Keep at least one Arokh power.");
+			return false;
+		}
+		if (!arokh_attack_idle(ps2, arokh_powers.controller))
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Release Arokh's attack and wait for it to finish, then remove the power.");
+			return false;
+		}
+		const auto registry = read_ee_value<uint32_t>(ps2, arokh_powers.manager + 0x320);
+		if (!valid_ee_address(registry, 0x30))
+			return false;
+		const auto rows = read_ee_value<uint32_t>(ps2, registry + 8);
+		const auto resources = read_ee_value<uint32_t>(ps2, registry + 0x10);
+		if (!valid_ee_address(registry, 0x30) || resources == 0 || resources > 20000 ||
+			!valid_ee_address(rows, resources * 36) ||
+			read_ee_value<uint32_t>(ps2, 0x003D35C8) != 0x0C0F491E ||
+			read_ee_value<uint32_t>(ps2, 0x002706E0) != 0x27BDFFF0 ||
+			read_ee_value<uint32_t>(ps2, 0x00270790) != 0x0C09B3EE ||
+			read_ee_value<uint32_t>(ps2, 0x0026CFB8) != 0x27BDFFC0)
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Power removal unavailable in this game state.");
+			return false;
+		}
+		if (!arokh_workspace_available(ps2))
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Power removal unavailable: another command owns the workspace.");
+			return false;
+		}
+		upload_arokh_program(ps2, arokh_action::remove_power);
+		if (read_render_program<drakan_arokh_remove_program::remove_power.size()>(ps2, arokh_code_cave) !=
+			drakan_arokh_remove_program::remove_power)
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Could not prepare power removal.");
+			return false;
+		}
+		const auto& target = arokh_powers.powers[index];
+		const std::array<uint32_t, 16> request = {{ arokh_powers.manager, arokh_powers.controller,
+			arokh_powers.active_actor, index, static_cast<uint32_t>(arokh_powers.selected),
+			arokh_powers.records, arokh_powers.capacity, arokh_powers.count,
+			target.primary, target.secondary, target.hud, target.flags, rows, target.primary_key,
+			resources, registry }};
+		ps2_ipc_cmd install(ps2);
+		for (uint32_t i = 0; i < request.size(); ++i)
+			install.write<uint32_t>(arokh_power_request + i * 4, request[i]);
+		install.write<uint32_t>(arokh_completion_latch, 0);
+		install.write<uint32_t>(debug_update_hook, arokh_temporary_hook);
+		install.send();
+		arokh_remove_before = arokh_powers;
+		arokh_remove_index = static_cast<int>(index);
+		debug_state = debug_command_state::waiting_for_arokh_power;
+		arokh_missing = false;
+		arokh_message = nullptr;
+		const auto* name = arokh_power_name(target.primary_key);
+		std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Removing %s...", name ? name : "power");
+		return true;
+	}
+
+	void finish_arokh_remove(const pcsx2& ps2, bool completed)
+	{
+		refresh_arokh_powers(ps2);
+		const auto index = static_cast<uint32_t>(arokh_remove_index);
+		const auto& before = arokh_remove_before;
+		int32_t selected = before.selected;
+		if (selected < 0 || selected == static_cast<int32_t>(index)) selected = 0;
+		else if (selected > static_cast<int32_t>(index)) --selected;
+		bool removed = completed && arokh_powers_available &&
+			arokh_powers.manager == before.manager && arokh_powers.controller == before.controller &&
+			arokh_powers.records == before.records && arokh_powers.capacity == before.capacity &&
+			arokh_powers.count + 1 == before.count && arokh_powers.selected == selected;
+		if (removed)
+			for (uint32_t i = 0; i < arokh_powers.count; ++i)
+				if (!same_arokh_power(arokh_powers.powers[i], before.powers[i < index ? i : i + 1]))
+					removed = false;
+		const auto* name = arokh_power_name(before.powers[index].primary_key);
+		arokh_remove_index = -1;
+		arokh_remove_before = {};
 	}
 
 	void draw_arokh_powers_ui(const pcsx2& ps2)
@@ -1299,7 +1423,20 @@ private:
 				const char* equipped = arokh_powers.selected == static_cast<int32_t>(i) ? " (equipped)" : "";
 				if (name != nullptr) ImGui::BulletText("%s%s", name, equipped);
 				else ImGui::BulletText("Other power (%u)%s", arokh_powers.powers[i].primary, equipped);
+				ImGui::SameLine();
+				ImGui::PushID(static_cast<int>(i));
+				ImGui::BeginDisabled(debug_state != debug_command_state::idle || arokh_powers.count <= 1);
+				const bool remove = ImGui::SmallButton("Remove");
+				ImGui::EndDisabled();
+				ImGui::PopID();
+				if (remove)
+				{
+					start_arokh_remove(ps2, i);
+					break; // Refresh can invalidate the rows currently being drawn.
+				}
 			}
+		if (arokh_powers_available && arokh_powers.count == 1)
+			ImGui::TextUnformatted("Keep at least one power.");
 		ImGui::PopID();
 	}
 
@@ -1343,9 +1480,11 @@ private:
 	{
 		const auto* wrapper = action == arokh_action::spawn ?
 			drakan_arokh_programs::spawn.data() :
+			action == arokh_action::remove_power ? drakan_arokh_remove_program::remove_power.data() :
 			action == arokh_action::give_power ? drakan_arokh_power_program::give_power.data() : drakan_arokh_programs::teleport.data();
 		const auto wrapper_size = action == arokh_action::spawn ?
 			drakan_arokh_programs::spawn.size() :
+			action == arokh_action::remove_power ? drakan_arokh_remove_program::remove_power.size() :
 			action == arokh_action::give_power ? drakan_arokh_power_program::give_power.size() : drakan_arokh_programs::teleport.size();
 		for (size_t offset = 0; offset < wrapper_size; offset += 128)
 		{
@@ -1446,8 +1585,31 @@ private:
 
 	bool start_debug_command(const pcsx2& ps2, debug_command_state command)
 	{
-		if (debug_state != debug_command_state::idle || command == debug_command_state::idle)
+		if (debug_state != debug_command_state::idle ||
+			(command != debug_command_state::waiting_for_fly &&
+			 command != debug_command_state::waiting_for_drop &&
+			 command != debug_command_state::waiting_for_hud &&
+			 command != debug_command_state::waiting_for_hendrix))
 			return false;
+
+		if (command == debug_command_state::waiting_for_hendrix)
+		{
+			if (!player_position_available || ps2.get_ipc()->Status() != PINE::PCSX2::Running)
+			{
+				return false;
+			}
+			// Verify the retail parser and both native skill/progression calls.
+			ps2_ipc_cmd verify(ps2);
+			auto parser = verify.queue_read<uint32_t>(0x002403B8);
+			auto skills = verify.queue_read<uint32_t>(0x002404F8);
+			auto progression = verify.queue_read<uint32_t>(0x00240500);
+			verify.send();
+			if (verify.read(parser) != 0x27BDFAF0 || verify.read(skills) != 0x0C0F563A ||
+				verify.read(progression) != 0x0C0F55CC)
+			{
+				return false;
+			}
+		}
 
 		if (command == debug_command_state::waiting_for_drop &&
 			(!fly_enabled || !player_position_available || !camera_position_available))
@@ -1487,12 +1649,18 @@ private:
 			install.write<uint32_t>(debug_code_cave + static_cast<uint32_t>(i * sizeof(uint32_t)), debug_wrapper[i]);
 		}
 		uint32_t command_text = fly_command;
+		uint32_t command_tail = 0;
 		if (command == debug_command_state::waiting_for_drop)
 			command_text = drop_command;
 		else if (command == debug_command_state::waiting_for_hud)
 			command_text = hud_command;
+		else if (command == debug_command_state::waiting_for_hendrix)
+		{
+			command_text = hendrix_command;
+			command_tail = hendrix_command_tail;
+		}
 		install.write<uint32_t>(debug_command_buffer, command_text);
-		install.write<uint32_t>(debug_command_buffer + sizeof(uint32_t), 0);
+		install.write<uint32_t>(debug_command_buffer + sizeof(uint32_t), command_tail);
 		install.write<uint32_t>(debug_completion_latch, 0);
 		install.write<uint32_t>(debug_update_hook, debug_temporary_hook); // Install the hook last.
 		install.send();
@@ -1761,6 +1929,12 @@ private:
 	{
 		if (!ImGui::CollapsingHeader("Gameplay", ImGuiTreeNodeFlags_DefaultOpen))
 			return;
+
+		ImGui::BeginDisabled(debug_state != debug_command_state::idle || !player_position_available ||
+			ps2.get_ipc()->Status() != PINE::PCSX2::Running);
+		if (ImGui::Button("Max Skills to 8"))
+			start_debug_command(ps2, debug_command_state::waiting_for_hendrix);
+		ImGui::EndDisabled();
 
 		draw_jump_height_ui(ps2);
 		ImGui::Separator();
