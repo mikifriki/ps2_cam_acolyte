@@ -446,14 +446,15 @@ private:
 	}};
 
 	template<size_t N>
-	static std::array<uint32_t, N> read_render_program(const pcsx2& ps2, uint32_t address)
+	static std::array<uint32_t, N> read_ee_words(const pcsx2& ps2, uint32_t address, size_t word_count = N)
 	{
-		std::array<uint32_t, N> words;
-		for (size_t first = 0; first < N; first += 128)
+		assert(word_count <= N);
+		std::array<uint32_t, N> words = {};
+		for (size_t first = 0; first < word_count; first += 128)
 		{
 			ps2_ipc_cmd read(ps2);
 			std::array<ps2_ipc_cmd::queued_read<uint32_t>, 128> queued;
-			const auto count = std::min(size_t(128), N - first);
+			const auto count = std::min(size_t(128), word_count - first);
 			for (size_t i = 0; i < count; ++i)
 				queued[i] = read.queue_read<uint32_t>(address + static_cast<uint32_t>((first + i) * 4));
 			read.send();
@@ -471,7 +472,7 @@ private:
 		{
 			if (callback != render_original_callback && callback != render_bootstrap_address)
 				return 0;
-			const auto existing = read_render_program<render_bootstrap.size()>(ps2, render_bootstrap_address);
+			const auto existing = read_ee_words<render_bootstrap.size()>(ps2, render_bootstrap_address);
 			if (existing != render_bootstrap)
 			{
 				if (callback != render_original_callback || existing != decltype(existing){})
@@ -480,7 +481,7 @@ private:
 				for (size_t i = 0; i < render_bootstrap.size(); ++i)
 					install.write<uint32_t>(render_bootstrap_address + static_cast<uint32_t>(i * 4), render_bootstrap[i]);
 				install.send();
-				if (read_render_program<render_bootstrap.size()>(ps2, render_bootstrap_address) != render_bootstrap)
+				if (read_ee_words<render_bootstrap.size()>(ps2, render_bootstrap_address) != render_bootstrap)
 					return 0;
 			}
 			ps2_ipc_cmd install_hook(ps2);
@@ -517,14 +518,14 @@ private:
 		// executor. Finish that installation only while it is still unreachable.
 		if (callback == render_original_callback)
 		{
-			if (read_render_program<render_bootstrap.size()>(ps2, render_bootstrap_address) != render_bootstrap)
+			if (read_ee_words<render_bootstrap.size()>(ps2, render_bootstrap_address) != render_bootstrap)
 				return 0;
 			ps2_ipc_cmd install(ps2);
 			for (size_t i = 0; i < executor.size(); ++i)
 				install.write<uint32_t>(code + static_cast<uint32_t>(i * 4), executor[i]);
 			install.write<uint32_t>(mailbox, 0).send();
 		}
-		if (read_render_program<executor.size()>(ps2, code) != executor ||
+		if (read_ee_words<executor.size()>(ps2, code) != executor ||
 			(callback != render_original_callback && callback != code))
 			return 0;
 		if (callback != code)
@@ -979,7 +980,6 @@ private:
 		std::array<arokh_power_record, 64> powers = {};
 	};
 	arokh_power_snapshot arokh_powers;
-	arokh_power_snapshot arokh_remove_before;
 	int arokh_remove_index = -1;
 	bool arokh_powers_available = false;
 	float arokh_power_refresh_time = 0.0f;
@@ -1062,7 +1062,7 @@ private:
 		next.controller = resolve_arokh_controller(ps2, next.manager, next.active_actor, rows, resources);
 		if (next.controller == 0)
 			return false;
-		const auto header = read_render_program<4>(ps2, next.controller + 0x6A4);
+		const auto header = read_ee_words<4>(ps2, next.controller + 0x6A4);
 		next.selected = static_cast<int32_t>(header[0]);
 		next.records = header[1];
 		next.count = header[3];
@@ -1071,23 +1071,13 @@ private:
 			next.selected < -1 || (next.selected >= 0 && static_cast<uint32_t>(next.selected) >= next.count) ||
 			(next.count != 0 && !valid_ee_address(next.records, next.count * 16)))
 			return false;
-		// 32 records per IPC batch keeps the command count below 256.
-		for (uint32_t first = 0; first < next.count; first += 32)
+		const auto words = read_ee_words<64 * 4>(ps2, next.records, next.count * 4);
+		for (uint32_t i = 0; i < next.count; ++i)
 		{
-			ps2_ipc_cmd read(ps2);
-			std::array<ps2_ipc_cmd::queued_read<uint32_t>, 128> words;
-			const auto count = std::min(32u, next.count - first);
-			for (uint32_t i = 0; i < count * 4; ++i)
-				words[i] = read.queue_read<uint32_t>(next.records + first * 16 + i * 4);
-			read.send();
-			for (uint32_t i = 0; i < count; ++i)
-			{
-				auto& power = next.powers[first + i];
-				power = { read.read(words[i * 4]), read.read(words[i * 4 + 1]),
-					read.read(words[i * 4 + 2]), read.read(words[i * 4 + 3]), 0 };
-				if (power.primary >= resources || (power.secondary != 0xFFFFFFFF && power.secondary >= resources))
-					return false;
-			}
+			auto& power = next.powers[i];
+			power = { words[i * 4], words[i * 4 + 1], words[i * 4 + 2], words[i * 4 + 3], 0 };
+			if (power.primary >= resources || (power.secondary != 0xFFFFFFFF && power.secondary >= resources))
+				return false;
 		}
 		if (next.count != 0)
 		{
@@ -1106,7 +1096,7 @@ private:
 			read_ee_value<uint32_t>(ps2, registry + 8) != rows ||
 			read_ee_value<uint32_t>(ps2, registry + 0x10) != resources ||
 			resolve_arokh_controller(ps2, next.manager, next.active_actor, rows, resources) != next.controller ||
-			read_render_program<4>(ps2, next.controller + 0x6A4) != header)
+			read_ee_words<4>(ps2, next.controller + 0x6A4) != header)
 			return false;
 		snapshot = next;
 		return true;
@@ -1135,8 +1125,6 @@ private:
 				return option.name;
 		// Identify by projectile identity, not the reused HUD icon.
 		if (key == 0x00033850) return "Sonic";
-		if (key == 0x00033801) return "Lava Ball";
-		if (key == 0x00033A20) return "Sea Dragon Lightning Ball";
 		return nullptr;
 	}
 
@@ -1179,6 +1167,12 @@ private:
 			read_ee_value<uint32_t>(ps2, registry + 0x10) == count;
 	}
 
+	bool fail_arokh_power(const char* message)
+	{
+		std::snprintf(arokh_power_message, sizeof(arokh_power_message), "%s", message);
+		return false;
+	}
+
 	bool start_arokh_power(const pcsx2& ps2)
 	{
 		if (debug_state != debug_command_state::idle || arokh_power_selection < 0 ||
@@ -1186,10 +1180,7 @@ private:
 			return false;
 		refresh_arokh_powers(ps2);
 		if (!arokh_powers_available || ps2.get_ipc()->Status() != PINE::PCSX2::Running)
-		{
-			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Arokh powers unavailable. Resume gameplay with Arokh present.");
-			return false;
-		}
+			return fail_arokh_power("Arokh powers unavailable. Resume gameplay with Arokh present.");
 		const auto& option = arokh_power_options[arokh_power_selection];
 		if (arokh_has_power(option.primary_key))
 		{
@@ -1208,19 +1199,13 @@ private:
 			(!projectile && read_ee_value<uint32_t>(ps2, 0x002403B8) != 0x27BDFAF0) ||
 			(projectile && (read_ee_value<uint32_t>(ps2, 0x0027D018) != 0x27BDFF40 ||
 			 read_ee_value<uint32_t>(ps2, 0x002706E0) != 0x27BDFFF0)))
-		{
-			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Arokh power commands unavailable in this game state.");
-			return false;
-		}
+			return fail_arokh_power("Arokh power commands unavailable in this game state.");
 		if (!arokh_workspace_available(ps2))
 			return false;
 		upload_arokh_program(ps2, arokh_action::give_power);
-		if (read_render_program<drakan_arokh_power_program::give_power.size()>(ps2, arokh_code_cave) !=
+		if (read_ee_words<drakan_arokh_power_program::give_power.size()>(ps2, arokh_code_cave) !=
 			drakan_arokh_power_program::give_power)
-		{
-			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Could not prepare Arokh's power command.");
-			return false;
-		}
+			return fail_arokh_power("Could not prepare Arokh's power command.");
 		ps2_ipc_cmd install(ps2);
 		// Fixed commands only; selecting the dropdown never writes to the game.
 		const auto length = option.command != nullptr ? std::strlen(option.command) : 0;
@@ -1228,22 +1213,18 @@ private:
 		{
 			install.write<uint8_t>(arokh_power_command_buffer + i, i < length ? option.command[i] : 0);
 		}
-		install.write<uint32_t>(arokh_power_request, arokh_powers.manager);
-		install.write<uint32_t>(arokh_power_request + 4, arokh_powers.controller);
-		install.write<uint32_t>(arokh_power_request + 8, arokh_powers.active_actor);
-		install.write<uint32_t>(arokh_power_request + 12, projectile ? 1 : 0);
-		install.write<uint32_t>(arokh_power_request + 16, rows);
-		install.write<uint32_t>(arokh_power_request + 20, resource_index);
-		install.write<uint32_t>(arokh_power_request + 24, option.primary_key);
-		install.write<uint32_t>(arokh_power_request + 28, option.resource_class);
+		const std::array<uint32_t, 8> request = {{ arokh_powers.manager, arokh_powers.controller,
+			arokh_powers.active_actor, projectile ? 1u : 0u, rows, resource_index,
+			option.primary_key, option.resource_class }};
+		for (uint32_t i = 0; i < request.size(); ++i)
+			install.write<uint32_t>(arokh_power_request + i * 4, request[i]);
 		// Null-source native weapon event; use existing elemental HUD resources.
 		install.write<uint32_t>(0x01FF0730, 0);
 		install.write<uint32_t>(0x01FF0734, 0x01FF0740);
-		install.write<uint32_t>(0x01FF0740, 0x1005);
-		install.write<uint32_t>(0x01FF0744, resource_index);
-		install.write<uint32_t>(0x01FF0748, 0xFFFFFFFF);
-		install.write<uint32_t>(0x01FF074C, option.hud_slot);
-		install.write<uint32_t>(0x01FF0750, 0);
+		const std::array<uint32_t, 5> payload = {{ 0x1005, resource_index,
+			0xFFFFFFFF, option.hud_slot, 0 }};
+		for (uint32_t i = 0; i < payload.size(); ++i)
+			install.write<uint32_t>(0x01FF0740 + i * 4, payload[i]);
 		install.write<uint32_t>(arokh_completion_latch, 0);
 		install.write<uint32_t>(debug_update_hook, arokh_temporary_hook);
 		install.send();
@@ -1259,7 +1240,8 @@ private:
 	{
 		if (arokh_remove_index >= 0)
 		{
-			finish_arokh_remove(ps2, completed);
+			refresh_arokh_powers(ps2);
+			arokh_remove_index = -1;
 			return;
 		}
 		refresh_arokh_powers(ps2);
@@ -1304,20 +1286,11 @@ private:
 		if (!arokh_powers_available || ps2.get_ipc()->Status() != PINE::PCSX2::Running ||
 			arokh_powers.controller != clicked.controller || arokh_powers.manager != clicked.manager ||
 			index >= arokh_powers.count || !same_arokh_power(clicked.powers[index], arokh_powers.powers[index]))
-		{
-			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Powers changed. Select Remove again during gameplay.");
-			return false;
-		}
+			return fail_arokh_power("Powers changed. Select Remove again during gameplay.");
 		if (arokh_powers.count <= 1)
-		{
-			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Keep at least one Arokh power.");
-			return false;
-		}
+			return fail_arokh_power("Keep at least one Arokh power.");
 		if (!arokh_attack_idle(ps2, arokh_powers.controller))
-		{
-			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Release Arokh's attack and wait for it to finish, then remove the power.");
-			return false;
-		}
+			return fail_arokh_power("Release Arokh's attack and wait for it to finish, then remove the power.");
 		const auto registry = read_ee_value<uint32_t>(ps2, arokh_powers.manager + 0x320);
 		if (!valid_ee_address(registry, 0x30))
 			return false;
@@ -1329,22 +1302,13 @@ private:
 			read_ee_value<uint32_t>(ps2, 0x002706E0) != 0x27BDFFF0 ||
 			read_ee_value<uint32_t>(ps2, 0x00270790) != 0x0C09B3EE ||
 			read_ee_value<uint32_t>(ps2, 0x0026CFB8) != 0x27BDFFC0)
-		{
-			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Power removal unavailable in this game state.");
-			return false;
-		}
+			return fail_arokh_power("Power removal unavailable in this game state.");
 		if (!arokh_workspace_available(ps2))
-		{
-			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Power removal unavailable: another command owns the workspace.");
-			return false;
-		}
+			return fail_arokh_power("Power removal unavailable: another command owns the workspace.");
 		upload_arokh_program(ps2, arokh_action::remove_power);
-		if (read_render_program<drakan_arokh_remove_program::remove_power.size()>(ps2, arokh_code_cave) !=
+		if (read_ee_words<drakan_arokh_remove_program::remove_power.size()>(ps2, arokh_code_cave) !=
 			drakan_arokh_remove_program::remove_power)
-		{
-			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Could not prepare power removal.");
-			return false;
-		}
+			return fail_arokh_power("Could not prepare power removal.");
 		const auto& target = arokh_powers.powers[index];
 		const std::array<uint32_t, 16> request = {{ arokh_powers.manager, arokh_powers.controller,
 			arokh_powers.active_actor, index, static_cast<uint32_t>(arokh_powers.selected),
@@ -1357,7 +1321,6 @@ private:
 		install.write<uint32_t>(arokh_completion_latch, 0);
 		install.write<uint32_t>(debug_update_hook, arokh_temporary_hook);
 		install.send();
-		arokh_remove_before = arokh_powers;
 		arokh_remove_index = static_cast<int>(index);
 		debug_state = debug_command_state::waiting_for_arokh_power;
 		arokh_missing = false;
@@ -1365,27 +1328,6 @@ private:
 		const auto* name = arokh_power_name(target.primary_key);
 		std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Removing %s...", name ? name : "power");
 		return true;
-	}
-
-	void finish_arokh_remove(const pcsx2& ps2, bool completed)
-	{
-		refresh_arokh_powers(ps2);
-		const auto index = static_cast<uint32_t>(arokh_remove_index);
-		const auto& before = arokh_remove_before;
-		int32_t selected = before.selected;
-		if (selected < 0 || selected == static_cast<int32_t>(index)) selected = 0;
-		else if (selected > static_cast<int32_t>(index)) --selected;
-		bool removed = completed && arokh_powers_available &&
-			arokh_powers.manager == before.manager && arokh_powers.controller == before.controller &&
-			arokh_powers.records == before.records && arokh_powers.capacity == before.capacity &&
-			arokh_powers.count + 1 == before.count && arokh_powers.selected == selected;
-		if (removed)
-			for (uint32_t i = 0; i < arokh_powers.count; ++i)
-				if (!same_arokh_power(arokh_powers.powers[i], before.powers[i < index ? i : i + 1]))
-					removed = false;
-		const auto* name = arokh_power_name(before.powers[index].primary_key);
-		arokh_remove_index = -1;
-		arokh_remove_before = {};
 	}
 
 	void draw_arokh_powers_ui(const pcsx2& ps2)
