@@ -4,6 +4,8 @@
 #include "shared_camera.h"
 #include "shared_ui.h"
 #include "drakan_arokh_programs.h"
+#include "drakan_arokh_power_program.h"
+#include <cstring>
 #include "glm/trigonometric.hpp"
 #include "glm/vec3.hpp"
 #include "glm/geometric.hpp"
@@ -906,6 +908,7 @@ private:
 		waiting_for_hud,
 		waiting_for_arokh,
 		waiting_for_arokh_spawn,
+		waiting_for_arokh_power,
 	};
 
 	debug_command_state debug_state = debug_command_state::idle;
@@ -914,7 +917,7 @@ private:
 	const char* arokh_message = nullptr;
 	const char* debug_command_message = nullptr;
 
-	enum class arokh_action { teleport, spawn };
+	enum class arokh_action { teleport, spawn, give_power };
 	enum class arokh_result : uint32_t
 	{
 		ready = 0,
@@ -924,6 +927,381 @@ private:
 		missing = 4,
 		already_exists = 5,
 	};
+
+	struct arokh_power_option
+	{
+		const char* name;
+		const char* command;
+		uint32_t primary_key;
+		uint32_t resource_class = 0; // Nonzero selects a native projectile grant.
+		uint32_t hud_slot = 0;
+	};
+	// Common resource keys, not disc record IDs or session-specific indices.
+	static constexpr std::array<arokh_power_option, 12> arokh_power_options = {{
+		{ "Fire", "GIVE Fire", 0x0003340A },
+		{ "Ice", "GIVE Ice", 0x00033524 },
+		{ "Lightning", "GIVE Lightning", 0x000329EF },
+		{ "Poison / Darkness", "GIVE Poison", 0x00032665 },
+		{ "Lava Ball", nullptr, 0x00033801, 0x10008, 0 },
+		{ "Sea Dragon Lightning Ball", nullptr, 0x00033A20, 0x10055, 3 },
+		{ "Grotus Magic", nullptr, 0x0003408C, 0x1006C, 0 },
+		{ "Crow Fire Breath", nullptr, 0x00032C74, 0x10008, 0 },
+		{ "Snow Crow Fireball", nullptr, 0x00032CEC, 0x10008, 0 },
+		{ "Skeleton Dragon Lightning", nullptr, 0x00032DB6, 0x1003A, 3 },
+		{ "Sonic Boom 01", nullptr, 0x00032E40, 0x10008, 1 },
+		{ "Sonic Boom 02", nullptr, 0x00032E5C, 0x10008, 1 },
+	}};
+	struct arokh_power_record
+	{
+		uint32_t primary;
+		uint32_t secondary;
+		uint32_t hud;
+		uint32_t flags;
+		uint32_t primary_key;
+	};
+	struct arokh_power_snapshot
+	{
+		uint32_t manager = 0;
+		uint32_t active_actor = 0;
+		uint32_t controller = 0;
+		uint32_t records = 0;
+		uint32_t count = 0;
+		int32_t selected = -1;
+		std::array<arokh_power_record, 64> powers = {};
+	};
+	arokh_power_snapshot arokh_powers;
+	bool arokh_powers_available = false;
+	float arokh_power_refresh_time = 0.0f;
+	int arokh_power_selection = 0;
+	int arokh_power_requested = -1;
+	char arokh_power_message[160] = {};
+	static constexpr uint32_t arokh_power_command_buffer = 0x01FF0700;
+	static constexpr uint32_t arokh_power_request = 0x01FF07C0;
+
+	uint32_t actor_controller(const pcsx2& ps2, uint32_t actor) const
+	{
+		if (!valid_ee_address(actor, 0x100))
+			return 0;
+		const auto relation = read_ee_value<uint32_t>(ps2, actor + 0xFC);
+		if (!valid_ee_address(relation, 0x14))
+			return 0;
+		const auto control = read_ee_value<uint32_t>(ps2, relation + 0x10);
+		return valid_ee_address(control, 0x6B4) ? control : 0;
+	}
+
+	// Read-only equivalent of native dragon lookup 0x003D2478. Mounted control
+	// already points at Arokh; on foot resolve Rynn's companion handle.
+	uint32_t resolve_arokh_controller(const pcsx2& ps2, uint32_t manager,
+		uint32_t active, uint32_t rows, uint32_t resource_count) const
+	{
+		if (!valid_ee_address(active, 0x100))
+			return 0;
+		const auto resource = read_ee_value<uint16_t>(ps2, active + 0x10);
+		if (resource >= resource_count)
+			return 0;
+		const auto type = read_ee_value<uint32_t>(ps2, rows + resource * 36 + 8);
+		auto actor = active;
+		auto control = actor_controller(ps2, actor);
+		if (control == 0)
+			return 0;
+		if (type == 0x10009)
+		{
+			const auto handle = read_ee_value<uint16_t>(ps2, control + 0x4D8);
+			const auto last_handle_index = read_ee_value<uint32_t>(ps2, manager + 0x84);
+			const auto handles = read_ee_value<uint32_t>(ps2, manager + 0x7C);
+			if (handle == 0 || last_handle_index >= 0x10000 ||
+				handle > last_handle_index + 1 || !valid_ee_address(handles, (last_handle_index + 1) * 8))
+				return 0;
+			actor = read_ee_value<uint32_t>(ps2, handles + (handle - 1) * 8);
+			if (!valid_ee_address(actor, 0x100))
+				return 0;
+			const auto dragon_resource = read_ee_value<uint16_t>(ps2, actor + 0x10);
+			if (dragon_resource >= resource_count ||
+				read_ee_value<uint32_t>(ps2, rows + dragon_resource * 36 + 8) != 0x1001C)
+				return 0;
+			control = actor_controller(ps2, actor);
+		}
+		else if (type != 0x1001C)
+			return 0;
+		if (control == 0 || read_ee_value<uint32_t>(ps2, control + 0x80) != actor ||
+			read_ee_value<uint32_t>(ps2, control + 0x57C) != 0x00525C58)
+			return 0;
+		// Mounted Arokh has no companion-active bit. Accept the verified active
+		// dragon actor directly; on foot still require an active companion.
+		const auto flags = read_ee_value<uint32_t>(ps2, control + 0x94);
+		if (((flags & 1) == 0 && actor != active) || (flags & 2) != 0)
+			return 0;
+		return control;
+	}
+
+	bool read_arokh_powers(const pcsx2& ps2, arokh_power_snapshot& snapshot) const
+	{
+		arokh_power_snapshot next;
+		next.manager = read_ee_value<uint32_t>(ps2, manager_global);
+		if (!valid_ee_address(next.manager, 0x524))
+			return false;
+		const auto registry = read_ee_value<uint32_t>(ps2, next.manager + 0x320);
+		if (!valid_ee_address(registry, 0x30))
+			return false;
+		const auto rows = read_ee_value<uint32_t>(ps2, registry + 8);
+		const auto resources = read_ee_value<uint32_t>(ps2, registry + 0x10);
+		if (resources == 0 || resources > 20000 || !valid_ee_address(rows, resources * 36))
+			return false;
+		next.active_actor = read_ee_value<uint32_t>(ps2, next.manager + 0x4B0);
+		next.controller = resolve_arokh_controller(ps2, next.manager, next.active_actor, rows, resources);
+		if (next.controller == 0)
+			return false;
+		const auto header = read_render_program<4>(ps2, next.controller + 0x6A4);
+		next.selected = static_cast<int32_t>(header[0]);
+		next.records = header[1];
+		next.count = header[3];
+		if (next.count > next.powers.size() || header[2] < next.count || header[2] > 65536 ||
+			next.selected < -1 || (next.selected >= 0 && static_cast<uint32_t>(next.selected) >= next.count) ||
+			(next.count != 0 && !valid_ee_address(next.records, next.count * 16)))
+			return false;
+		// 32 records per IPC batch keeps the command count below 256.
+		for (uint32_t first = 0; first < next.count; first += 32)
+		{
+			ps2_ipc_cmd read(ps2);
+			std::array<ps2_ipc_cmd::queued_read<uint32_t>, 128> words;
+			const auto count = std::min(32u, next.count - first);
+			for (uint32_t i = 0; i < count * 4; ++i)
+				words[i] = read.queue_read<uint32_t>(next.records + first * 16 + i * 4);
+			read.send();
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				auto& power = next.powers[first + i];
+				power = { read.read(words[i * 4]), read.read(words[i * 4 + 1]),
+					read.read(words[i * 4 + 2]), read.read(words[i * 4 + 3]), 0 };
+				if (power.primary >= resources || (power.secondary != 0xFFFFFFFF && power.secondary >= resources))
+					return false;
+			}
+		}
+		if (next.count != 0)
+		{
+			ps2_ipc_cmd read_keys(ps2);
+			std::array<ps2_ipc_cmd::queued_read<uint32_t>, 64> keys;
+			for (uint32_t i = 0; i < next.count; ++i)
+				keys[i] = read_keys.queue_read<uint32_t>(rows + next.powers[i].primary * 36);
+			read_keys.send();
+			for (uint32_t i = 0; i < next.count; ++i)
+				next.powers[i].primary_key = read_keys.read(keys[i]);
+		}
+		// A load or list reallocation between batches invalidates the snapshot.
+		if (read_ee_value<uint32_t>(ps2, manager_global) != next.manager ||
+			read_ee_value<uint32_t>(ps2, next.manager + 0x4B0) != next.active_actor ||
+			read_ee_value<uint32_t>(ps2, next.manager + 0x320) != registry ||
+			read_ee_value<uint32_t>(ps2, registry + 8) != rows ||
+			read_ee_value<uint32_t>(ps2, registry + 0x10) != resources ||
+			resolve_arokh_controller(ps2, next.manager, next.active_actor, rows, resources) != next.controller ||
+			read_render_program<4>(ps2, next.controller + 0x6A4) != header)
+			return false;
+		snapshot = next;
+		return true;
+	}
+
+	void refresh_arokh_powers(const pcsx2& ps2)
+	{
+		arokh_powers_available = player_position_available && read_arokh_powers(ps2, arokh_powers);
+		if (!arokh_powers_available)
+			arokh_powers = {};
+		arokh_power_refresh_time = 0.0f;
+	}
+
+	bool arokh_has_power(uint32_t key) const
+	{
+		for (uint32_t i = 0; i < arokh_powers.count; ++i)
+			if (arokh_powers.powers[i].primary_key == key)
+				return true;
+		return false;
+	}
+
+	static const char* arokh_power_name(uint32_t key)
+	{
+		for (const auto& option : arokh_power_options)
+			if (option.primary_key == key)
+				return option.name;
+		// Identify by projectile identity, not the reused HUD icon.
+		if (key == 0x00033850) return "Sonic";
+		if (key == 0x00033801) return "Lava Ball";
+		if (key == 0x00033A20) return "Sea Dragon Lightning Ball";
+		return nullptr;
+	}
+
+	// Resolve each candidate from this level's live registry. Never reuse a
+	// previous session's resource index or accept a same-key different class.
+	bool resolve_arokh_projectile(const pcsx2& ps2, const arokh_power_option& option,
+		uint32_t& rows, uint32_t& index) const
+	{
+		const auto registry = read_ee_value<uint32_t>(ps2, arokh_powers.manager + 0x320);
+		if (!valid_ee_address(registry, 0x30))
+			return false;
+		rows = read_ee_value<uint32_t>(ps2, registry + 8);
+		const auto count = read_ee_value<uint32_t>(ps2, registry + 0x10);
+		if (count == 0 || count > 20000 || !valid_ee_address(rows, count * 36))
+			return false;
+		index = 0xFFFFFFFF;
+		for (uint32_t first = 0; first < count; first += 64)
+		{
+			ps2_ipc_cmd read(ps2);
+			std::array<ps2_ipc_cmd::queued_read<uint32_t>, 128> entries;
+			const auto batch = std::min(64u, count - first);
+			for (uint32_t i = 0; i < batch; ++i)
+			{
+				entries[i * 2] = read.queue_read<uint32_t>(rows + (first + i) * 36);
+				entries[i * 2 + 1] = read.queue_read<uint32_t>(rows + (first + i) * 36 + 8);
+			}
+			read.send();
+			for (uint32_t i = 0; i < batch; ++i)
+				if (read.read(entries[i * 2]) == option.primary_key &&
+					read.read(entries[i * 2 + 1]) == option.resource_class)
+				{
+					if (index != 0xFFFFFFFF) return false;
+					index = first + i;
+				}
+		}
+		return index != 0xFFFFFFFF &&
+			read_ee_value<uint32_t>(ps2, manager_global) == arokh_powers.manager &&
+			read_ee_value<uint32_t>(ps2, arokh_powers.manager + 0x320) == registry &&
+			read_ee_value<uint32_t>(ps2, registry + 8) == rows &&
+			read_ee_value<uint32_t>(ps2, registry + 0x10) == count;
+	}
+
+	bool start_arokh_power(const pcsx2& ps2)
+	{
+		if (debug_state != debug_command_state::idle || arokh_power_selection < 0 ||
+			arokh_power_selection >= static_cast<int>(arokh_power_options.size()))
+			return false;
+		refresh_arokh_powers(ps2);
+		if (!arokh_powers_available || ps2.get_ipc()->Status() != PINE::PCSX2::Running)
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Arokh powers unavailable. Resume gameplay with Arokh present.");
+			return false;
+		}
+		const auto& option = arokh_power_options[arokh_power_selection];
+		if (arokh_has_power(option.primary_key))
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Arokh already has %s.", option.name);
+			return false;
+		}
+		const bool projectile = option.resource_class != 0;
+		uint32_t rows = 0, resource_index = 0xFFFFFFFF;
+		if (projectile && (!resolve_arokh_projectile(ps2, option, rows, resource_index) ||
+			arokh_powers.count >= arokh_powers.powers.size()))
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "%s is unavailable in this level.", option.name);
+			return false;
+		}
+		if (read_ee_value<uint32_t>(ps2, 0x003D35C8) != 0x0C0F491E ||
+			(!projectile && read_ee_value<uint32_t>(ps2, 0x002403B8) != 0x27BDFAF0) ||
+			(projectile && (read_ee_value<uint32_t>(ps2, 0x0027D018) != 0x27BDFF40 ||
+			 read_ee_value<uint32_t>(ps2, 0x002706E0) != 0x27BDFFF0)))
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Arokh power commands unavailable in this game state.");
+			return false;
+		}
+		if (!arokh_workspace_available(ps2))
+			return false;
+		upload_arokh_program(ps2, arokh_action::give_power);
+		if (read_render_program<drakan_arokh_power_program::give_power.size()>(ps2, arokh_code_cave) !=
+			drakan_arokh_power_program::give_power)
+		{
+			std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Could not prepare Arokh's power command.");
+			return false;
+		}
+		ps2_ipc_cmd install(ps2);
+		// Fixed commands only; selecting the dropdown never writes to the game.
+		const auto length = option.command != nullptr ? std::strlen(option.command) : 0;
+		for (uint32_t i = 0; i < 32; ++i)
+		{
+			install.write<uint8_t>(arokh_power_command_buffer + i, i < length ? option.command[i] : 0);
+		}
+		install.write<uint32_t>(arokh_power_request, arokh_powers.manager);
+		install.write<uint32_t>(arokh_power_request + 4, arokh_powers.controller);
+		install.write<uint32_t>(arokh_power_request + 8, arokh_powers.active_actor);
+		install.write<uint32_t>(arokh_power_request + 12, projectile ? 1 : 0);
+		install.write<uint32_t>(arokh_power_request + 16, rows);
+		install.write<uint32_t>(arokh_power_request + 20, resource_index);
+		install.write<uint32_t>(arokh_power_request + 24, option.primary_key);
+		install.write<uint32_t>(arokh_power_request + 28, option.resource_class);
+		// Null-source native weapon event; use existing elemental HUD resources.
+		install.write<uint32_t>(0x01FF0730, 0);
+		install.write<uint32_t>(0x01FF0734, 0x01FF0740);
+		install.write<uint32_t>(0x01FF0740, 0x1005);
+		install.write<uint32_t>(0x01FF0744, resource_index);
+		install.write<uint32_t>(0x01FF0748, 0xFFFFFFFF);
+		install.write<uint32_t>(0x01FF074C, option.hud_slot);
+		install.write<uint32_t>(0x01FF0750, 0);
+		install.write<uint32_t>(arokh_completion_latch, 0);
+		install.write<uint32_t>(debug_update_hook, arokh_temporary_hook);
+		install.send();
+		arokh_power_requested = arokh_power_selection;
+		debug_state = debug_command_state::waiting_for_arokh_power;
+		arokh_missing = false;
+		arokh_message = nullptr;
+		std::snprintf(arokh_power_message, sizeof(arokh_power_message), "Applying %s...", option.name);
+		return true;
+	}
+
+	void finish_arokh_power(const pcsx2& ps2, bool completed)
+	{
+		refresh_arokh_powers(ps2);
+		const auto& option = arokh_power_options[arokh_power_requested];
+		bool granted = completed && arokh_powers_available && arokh_has_power(option.primary_key);
+		if (granted && option.resource_class != 0)
+		{
+			const auto selected = arokh_powers.selected;
+			granted = selected >= 0 && static_cast<uint32_t>(selected) < arokh_powers.count;
+			if (granted)
+			{
+				const auto& record = arokh_powers.powers[selected];
+				granted = record.primary_key == option.primary_key && record.secondary == 0xFFFFFFFF &&
+					record.hud == option.hud_slot && record.flags == 0;
+			}
+		}
+		std::snprintf(arokh_power_message, sizeof(arokh_power_message), granted ?
+			"Arokh has %s." : "Could not confirm %s. Check Arokh's powers and try again.", option.name);
+		arokh_power_requested = -1;
+	}
+
+	void draw_arokh_powers_ui(const pcsx2& ps2)
+	{
+		ImGui::PushID("arokh_powers");
+		ImGui::SetNextItemWidth(240.0f);
+		if (ImGui::BeginCombo("Power", arokh_power_options[arokh_power_selection].name))
+		{
+			for (int i = 0; i < static_cast<int>(arokh_power_options.size()); ++i)
+			{
+				if (i == 4) ImGui::SeparatorText("Experimental projectiles");
+				const bool selected = i == arokh_power_selection;
+				if (ImGui::Selectable(arokh_power_options[i].name, selected))
+					arokh_power_selection = i;
+				if (selected) ImGui::SetItemDefaultFocus();
+			}
+			ImGui::EndCombo();
+		}
+		ImGui::SameLine();
+		ImGui::BeginDisabled(debug_state != debug_command_state::idle || !arokh_powers_available);
+		if (ImGui::Button("Apply"))
+			start_arokh_power(ps2);
+		ImGui::EndDisabled();
+		if (arokh_power_message[0] != '\0')
+			ImGui::TextWrapped("%s", arokh_power_message);
+		ImGui::TextUnformatted("Current powers");
+		if (!arokh_powers_available)
+			ImGui::TextUnformatted("Unavailable - Arokh must be present in gameplay.");
+		else if (arokh_powers.count == 0)
+			ImGui::TextUnformatted("No powers.");
+		else
+			for (uint32_t i = 0; i < arokh_powers.count; ++i)
+			{
+				const auto* name = arokh_power_name(arokh_powers.powers[i].primary_key);
+				const char* equipped = arokh_powers.selected == static_cast<int32_t>(i) ? " (equipped)" : "";
+				if (name != nullptr) ImGui::BulletText("%s%s", name, equipped);
+				else ImGui::BulletText("Other power (%u)%s", arokh_powers.powers[i].primary, equipped);
+			}
+		ImGui::PopID();
+	}
 
 	bool arokh_workspace_available(const pcsx2& ps2)
 	{
@@ -964,9 +1342,11 @@ private:
 	void upload_arokh_program(const pcsx2& ps2, arokh_action action)
 	{
 		const auto* wrapper = action == arokh_action::spawn ?
-			drakan_arokh_programs::spawn.data() : drakan_arokh_programs::teleport.data();
+			drakan_arokh_programs::spawn.data() :
+			action == arokh_action::give_power ? drakan_arokh_power_program::give_power.data() : drakan_arokh_programs::teleport.data();
 		const auto wrapper_size = action == arokh_action::spawn ?
-			drakan_arokh_programs::spawn.size() : drakan_arokh_programs::teleport.size();
+			drakan_arokh_programs::spawn.size() :
+			action == arokh_action::give_power ? drakan_arokh_power_program::give_power.size() : drakan_arokh_programs::teleport.size();
 		for (size_t offset = 0; offset < wrapper_size; offset += 128)
 		{
 			ps2_ipc_cmd install_code(ps2);
@@ -1014,6 +1394,12 @@ private:
 		const auto result = static_cast<arokh_result>(completion_read.read(latch));
 		if (hook_value != arokh_temporary_hook)
 		{
+			if (debug_state == debug_command_state::waiting_for_arokh_power)
+			{
+				debug_state = debug_command_state::idle;
+				finish_arokh_power(ps2, false);
+				return;
+			}
 			arokh_missing = false;
 			arokh_message = debug_state == debug_command_state::waiting_for_arokh_spawn ?
 				"Arokh spawn interrupted." : "Arokh teleport interrupted.";
@@ -1036,6 +1422,12 @@ private:
 				clear_workspace.write<uint32_t>(arokh_code_cave + offset + word, 0);
 			}
 			clear_workspace.send();
+		}
+		if (debug_state == debug_command_state::waiting_for_arokh_power)
+		{
+			debug_state = debug_command_state::idle;
+			finish_arokh_power(ps2, result == arokh_result::complete);
+			return;
 		}
 		const bool spawning = debug_state == debug_command_state::waiting_for_arokh_spawn;
 		debug_state = debug_command_state::idle;
@@ -1112,7 +1504,8 @@ private:
 	void update_debug_command(const pcsx2& ps2)
 	{
 		if (debug_state == debug_command_state::waiting_for_arokh ||
-			debug_state == debug_command_state::waiting_for_arokh_spawn)
+			debug_state == debug_command_state::waiting_for_arokh_spawn ||
+			debug_state == debug_command_state::waiting_for_arokh_power)
 		{
 			update_arokh_command(ps2);
 			return;
@@ -1308,6 +1701,8 @@ private:
 			ImGui::TextUnformatted(arokh_message);
 
 		ImGui::Separator();
+		draw_arokh_powers_ui(ps2);
+		ImGui::Separator();
 		ImGui::Text("Arokh collision: %s", arokh_collision_flag.is_on() ? "Off" : "On");
 		if (ImGui::Button(arokh_collision_flag.is_on() ? "Enable Arokh Collision" : "Disable Arokh Collision"))
 		{
@@ -1462,9 +1857,14 @@ public:
 			infinite_bow_ammo.reset();
 			arokh_missing = false;
 			arokh_message = nullptr;
+			arokh_powers = {};
+			arokh_powers_available = false;
+			arokh_power_refresh_time = 0.5f;
+			arokh_power_message[0] = '\0';
 			// An in-flight Arokh command still needs its normal ownership check/cleanup.
 			if (debug_state != debug_command_state::waiting_for_arokh &&
-				debug_state != debug_command_state::waiting_for_arokh_spawn)
+				debug_state != debug_command_state::waiting_for_arokh_spawn &&
+				debug_state != debug_command_state::waiting_for_arokh_power)
 				debug_state = debug_command_state::idle;
 			fly_enabled = false;
 			debug_command_message = nullptr;
@@ -1474,6 +1874,15 @@ public:
 		update_player_position(ps2);
 		update_camera_position(ps2);
 		update_debug_command(ps2);
+		if (std::isfinite(time_delta) && time_delta > 0.0f)
+			arokh_power_refresh_time += time_delta;
+		if (!player_position_available)
+		{
+			arokh_powers_available = false;
+			arokh_powers = {};
+		}
+		else if (debug_state == debug_command_state::idle && arokh_power_refresh_time >= 0.5f)
+			refresh_arokh_powers(ps2);
 		update_fly_mode(ps2);
 		update_camera_speed(ps2);
 		update_render_distance(ps2);
