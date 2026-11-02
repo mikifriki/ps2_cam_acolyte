@@ -279,8 +279,8 @@ private:
 
 	static bool valid_distance_and_fog(float distance, float width)
 	{
-		return valid_render_distance(distance) && std::isfinite(width) &&
-			width > 0.0f && width <= distance;
+		// Retail levels can start fog behind the camera (width > distance).
+		return valid_render_distance(distance) && std::isfinite(width) && width > 0.0f;
 	}
 
 	// Property 92 is the loaded level's Max Fog Depth, in level units.
@@ -409,7 +409,10 @@ private:
 		const float distance_squared = distance * distance;
 		const float start_squared = start * start;
 		const float squared_span = distance_squared - start_squared;
-		if (width <= 0.0f || squared_span <= 0.0f ||
+		// Preserve the native signed squared span when fog starts behind the camera.
+		// Only a zero span is singular; negative spans are used by retail levels.
+		if (!std::isfinite(width) || !std::isfinite(start_squared) ||
+			!std::isfinite(squared_span) || width <= 0.0f || squared_span == 0.0f ||
 			!std::isfinite(1.0f / width) || !std::isfinite(1.0f / squared_span))
 			return false;
 
