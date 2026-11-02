@@ -29,7 +29,8 @@ private:
 	static constexpr uint32_t load_sentinel_address = 0x004DB270;
 	sentinel_counter sentinel;
 	restoring_toggle_state<5> collision_flag;
-	restoring_toggle_state<3> arokh_collision_flag;
+	restoring_toggle_state<8> arokh_collision_flag;
+	restoring_toggle_state<2> arokh_height_limit_flag;
 	bool collision_before_arokh = false;
 	tweakable_value_set<float, 3> fov_values;
 	read_only_value_set<float, 3> player_position;
@@ -1822,6 +1823,7 @@ private:
 			if (!arokh_collision_flag.is_on())
 				collision_before_arokh = collision_flag.is_on();
 			arokh_collision_flag.toggle();
+			arokh_height_limit_flag.set_on(arokh_collision_flag.is_on());
 			// Arokh also needs the existing shared movement bypass.
 			collision_flag.set_on(arokh_collision_flag.is_on() || collision_before_arokh);
 			sentinel.increment();
@@ -1918,7 +1920,18 @@ public:
 		, arokh_collision_flag(ps2, { {
 			{ 0x002744FC, 0xE6350904, 0xE6200904 }, // Keep the flight speed multiplier at 1.
 			{ 0x00280BE8, 0x03E00008, 0x27BDFE00 }, // Return before Arokh contact/impact response.
-			{ 0x00280BEC, 0x00000000, 0x3C03004F }  // Return delay slot.
+			{ 0x00280BEC, 0x00000000, 0x3C03004F }, // Return delay slot.
+			// Ignore external flight forces, including the level boundary pushback.
+			{ 0x002739C8, 0x00000000, 0x46020000 }, // Alternate flight path: force X.
+			{ 0x002739CC, 0x00000000, 0x46030840 }, // Alternate flight path: force Z.
+			{ 0x002739E4, 0x00000000, 0x46010000 }, // Normal flight path: force X.
+			{ 0x002739F8, 0x00000000, 0x46010000 }, // Normal flight path: force Y.
+			{ 0x00273A04, 0x00000000, 0x46011080 }  // Normal flight path: force Z.
+		} })
+		, arokh_height_limit_flag(ps2, { {
+			// These flight checks are independent of the obstacle collision bypass.
+			{ 0x00272368, 0x00000000, 0x45020006 }, // Allow ascent within 500 units of the level ceiling.
+			{ 0x00272BD8, 0x44806800, 0x4600A346 }  // Pass no upper clamp to the flight helper; retain its lower limit.
 		} })
 		, fov_values(ps2, { 
 			 { 0x006C65E0, 0x06C668C, 0x006C6674 },
@@ -1964,6 +1977,7 @@ public:
 			player_position_address = 0;
 			player_position_available = false;
 			camera_position_available = false;
+			arokh_height_limit_flag.reset();
 			arokh_collision_flag.reset();
 			collision_flag.reset();
 			collision_before_arokh = false;
